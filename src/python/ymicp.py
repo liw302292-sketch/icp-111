@@ -359,6 +359,8 @@ class CredentialState:
     auth_count: int = 0
     captcha_attempts: int = 0
     captcha_success: int = 0
+    consecutive_fails: int = 0
+    force_refresh: bool = False
     credential_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     status: str = "idle"
 
@@ -525,8 +527,6 @@ class beian:
         # APP/小程序/快应用详情查询接口
         self.queryDetailByAppAndMiniId = "https://hlwicpfwc.miit.gov.cn/icpproject_query/api/icpAbbreviateInfo/queryDetailByAppAndMiniId"
         self.sign = "eyJ0eXBlIjozLCJleHREYXRhIjp7InZhZnljb2RlX2ltYWdlX2tleSI6IjUyZWI1ZTcyODViNzRmNWJhM2YwYzBkNTg0YTg3NmVmIn0sImUiOjE3NTY5NzAyNDg4MjN9.Ngpkwn4T7sQoQF9pCk_sQQpH61wQUEKnK2sQ8hDIq-Q"
-        self.token = ""
-        self.token_expire = 0
         self.timeout = aiohttp.ClientTimeout(total=getattr(getattr(config, 'system', object()), 'http_client_timeout', 30) or 30)
         self.local_ipv6_addresses = get_local_ipv6_addresses() if getattr(getattr(getattr(config, 'proxy', object()), 'local_ipv6_pool', object()), 'enable', False) else []
         self.ipv6_index = 0
@@ -580,12 +580,12 @@ class beian:
         # === Token 轮换机制（解决"一把钥匙"问题）===
         # 同一个 Token 请求验证码过多会被 MIIT 服务器限制
         # 策略：每个 Token 最多打码 N 次后强制刷新，失败时也触发轮换
-        self._token_captcha_count = 0  # 当前Token已打码次数
-        self._token_consecutive_fails = 0  # 连续打码失败次数
         self._max_captcha_per_token = getattr(
             getattr(config, 'captcha', object()), 'max_per_token', 60
         ) or 60  # 每Token最大打码次数，默认60
-        self._token_force_refresh = False  # 强制刷新标记
+        # CredentialState：单个凭证的权威状态（token/expire/打码计数/锁），
+        # 取代原先分散的 self.token / self._token_* 实例字段。
+        self._credential = CredentialState()
         # 每IP查询配额（批量模式按配额轮换IP，避免单IP被限流/封禁）
         self._queries_per_ip = getattr(
             getattr(config, 'captcha', object()), 'queries_per_ip', 20
@@ -597,10 +597,6 @@ class beian:
         self._ip_states: dict = {}
 
         # 验证码改为每个查询独立内联打码（预取池/填充器已移除，避免死代码）
-        
-        # === Token 获取专用锁（防止并发重复auth） ===
-        self._token_fetch_lock = asyncio.Lock()
-        self._token_ipv6 = None  # 记录Token绑定的IPv6（MIIT可能校验来源IP一致性）
 
         # === 全局取号节流（关键）===
         # 实测：auth 突发（≥4路并发连续打）会让创宇盾对 auth 接口限流，
@@ -1024,14 +1020,14 @@ class beian:
 
     async def get_token(self, proxy="", force_refresh=False, ipv6=None, ctx=None):
         # ctx: QueryContext实例，支持并发隔离。None时使用实例状态（向后兼容）
-        _token = ctx.token if ctx else self.token
-        _token_expire = ctx.token_expire if ctx else self.token_expire
-        _token_ipv6 = ctx.token_ipv6 if ctx else self._token_ipv6
-        _captcha_count = ctx.captcha_count if ctx else self._token_captcha_count
-        _consecutive_fails = ctx.consecutive_fails if ctx else self._token_consecutive_fails
-        _force_refresh = ctx.force_refresh if ctx else self._token_force_refresh
+        _token = ctx.token if ctx else self._credential.token
+        _token_expire = ctx.token_expire if ctx else self._credential.token_expire
+        _token_ipv6 = ctx.token_ipv6 if ctx else self._credential.token_ipv6
+        _captcha_count = ctx.captcha_count if ctx else self._credential.captcha_count
+        _consecutive_fails = ctx.consecutive_fails if ctx else self._credential.consecutive_fails
+        _force_refresh = ctx.force_refresh if ctx else self._credential.force_refresh
         _max_captcha = ctx.max_captcha_per_token if ctx else self._max_captcha_per_token
-        _lock = ctx.token_lock if ctx else self._token_fetch_lock
+        _lock = ctx.token_lock if ctx else self._credential.credential_lock
         
         base_header = ctx._get_base_header() if ctx else _random_browser_headers()
 
@@ -1047,11 +1043,11 @@ class beian:
         async with _lock:
             # 双重检查：可能在等锁期间Token已被其他协程获取
             # 重新读取（ctx可能在等锁期间被更新）
-            _token2 = ctx.token if ctx else self.token
-            _token_expire2 = ctx.token_expire if ctx else self.token_expire
-            _token_ipv6_2 = ctx.token_ipv6 if ctx else self._token_ipv6
-            _captcha_count2 = ctx.captcha_count if ctx else self._token_captcha_count
-            _force_refresh2 = ctx.force_refresh if ctx else self._token_force_refresh
+            _token2 = ctx.token if ctx else self._credential.token
+            _token_expire2 = ctx.token_expire if ctx else self._credential.token_expire
+            _token_ipv6_2 = ctx.token_ipv6 if ctx else self._credential.token_ipv6
+            _captcha_count2 = ctx.captcha_count if ctx else self._credential.captcha_count
+            _force_refresh2 = ctx.force_refresh if ctx else self._credential.force_refresh
             
             if not force_refresh and not _force_refresh2 \
                and _captcha_count2 < _max_captcha \
@@ -1070,12 +1066,12 @@ class beian:
                     ctx.consecutive_fails = 0
                     ctx.force_refresh = False
                 else:
-                    self.token = ""
-                    self.token_expire = 0
-                    self._token_ipv6 = None
-                    self._token_captcha_count = 0
-                    self._token_consecutive_fails = 0
-                    self._token_force_refresh = False
+                    self._credential.token = ""
+                    self._credential.token_expire = 0
+                    self._credential.token_ipv6 = None
+                    self._credential.captcha_count = 0
+                    self._credential.consecutive_fails = 0
+                    self._credential.force_refresh = False
                 logger.info("🔄 Token 强制轮换，获取新 Token...")
             else:
                 logger.debug(f"🆕 无缓存Token或已过期, 获取新Token...")
@@ -1139,12 +1135,12 @@ class beian:
                                 ctx.consecutive_fails = 0
                                 ctx.force_refresh = False
                             else:
-                                self.token = token
-                                self.token_expire = expire
-                                self._token_ipv6 = ipv6
-                                self._token_captcha_count = 0
-                                self._token_consecutive_fails = 0
-                                self._token_force_refresh = False
+                                self._credential.token = token
+                                self._credential.token_expire = expire
+                                self._credential.token_ipv6 = ipv6
+                                self._credential.captcha_count = 0
+                                self._credential.consecutive_fails = 0
+                                self._credential.force_refresh = False
                             logger.info(f"🔑 新 Token 已获取 (IP={ipv6})，过期倒计时: {expire/1000:.0f}s")
                             self._auth_waf_fail_streak = 0
                             return True, token, base_header
@@ -1292,20 +1288,20 @@ class beian:
                 )
         
         # === Token 轮换：检查是否需要主动刷新 ===
-        _captcha_count = ctx.captcha_count if ctx else self._token_captcha_count
+        _captcha_count = ctx.captcha_count if ctx else self._credential.captcha_count
         _max_captcha = ctx.max_captcha_per_token if ctx else self._max_captcha_per_token
         if _captcha_count >= _max_captcha:
             logger.info(f"🔄 Token 已达 {_max_captcha} 次上限，主动轮换...")
             if ctx:
                 ctx.force_refresh = True
             else:
-                self._token_force_refresh = True
+                self._credential.force_refresh = True
         
         # 复用传入的IPv6（同查询链路优化），没有则获取新的
         if ipv6 is None and not proxy and self.local_ipv6_addresses:
             ipv6 = await self._get_ipv6_sticky()
         
-        _force_refresh = ctx.force_refresh if ctx else self._token_force_refresh
+        _force_refresh = ctx.force_refresh if ctx else self._credential.force_refresh
         success, token, base_header = await self.get_token(proxy, force_refresh=_force_refresh, ipv6=ipv6, ctx=ctx)
         _t_token = time.time()
         if not success:
@@ -1339,10 +1335,10 @@ class beian:
                         logger.warning(f"⛔ 获取验证码连续{ctx.consecutive_fails}次失败，标记Token强制刷新")
                         ctx.force_refresh = True
                 else:
-                    self._token_consecutive_fails += 1
-                    if self._token_consecutive_fails >= 2:
-                        logger.warning(f"⛔ 获取验证码连续{self._token_consecutive_fails}次失败，标记Token强制刷新")
-                        self._token_force_refresh = True
+                    self._credential.consecutive_fails += 1
+                    if self._credential.consecutive_fails >= 2:
+                        logger.warning(f"⛔ 获取验证码连续{self._credential.consecutive_fails}次失败，标记Token强制刷新")
+                        self._credential.force_refresh = True
                 return False, f"请求验证码时失败：{e}", '', '', ''
 
             _t_getimg = time.time()
@@ -1382,10 +1378,10 @@ class beian:
                         logger.warning(f"⛔ 提交验证码连续{ctx.consecutive_fails}次失败，标记Token强制刷新")
                         ctx.force_refresh = True
                 else:
-                    self._token_consecutive_fails += 1
-                    if self._token_consecutive_fails >= 2:
-                        logger.warning(f"⛔ 提交验证码连续{self._token_consecutive_fails}次失败，标记Token强制刷新")
-                        self._token_force_refresh = True
+                    self._credential.consecutive_fails += 1
+                    if self._credential.consecutive_fails >= 2:
+                        logger.warning(f"⛔ 提交验证码连续{self._credential.consecutive_fails}次失败，标记Token强制刷新")
+                        self._credential.force_refresh = True
                 return False, f"提交验证码时失败：{e}", '', '', ''
 
             _t_check = time.time()
@@ -1401,11 +1397,11 @@ class beian:
                         logger.warning(f"⛔ 连续{ctx.consecutive_fails}次打码失败，标记Token强制刷新")
                         ctx.force_refresh = True
                 else:
-                    self._token_consecutive_fails += 1
-                    logger.warning(f"⚠️ 打码失败 (连续{self._token_consecutive_fails}次)")
-                    if self._token_consecutive_fails >= 2:
-                        logger.warning(f"⛔ 连续{self._token_consecutive_fails}次打码失败，标记Token强制刷新")
-                        self._token_force_refresh = True
+                    self._credential.consecutive_fails += 1
+                    logger.warning(f"⚠️ 打码失败 (连续{self._credential.consecutive_fails}次)")
+                    if self._credential.consecutive_fails >= 2:
+                        logger.warning(f"⛔ 连续{self._credential.consecutive_fails}次打码失败，标记Token强制刷新")
+                        self._credential.force_refresh = True
                 
                 captcha_config = getattr(config, 'captcha', object())
                 if getattr(captcha_config, 'save_failed_img', False):
@@ -1428,9 +1424,9 @@ class beian:
                     _cc = ctx.captcha_count
                     _mc = ctx.max_captcha_per_token
                 else:
-                    self._token_captcha_count += 1
-                    self._token_consecutive_fails = 0
-                    _cc = self._token_captcha_count
+                    self._credential.captcha_count += 1
+                    self._credential.consecutive_fails = 0
+                    _cc = self._credential.captcha_count
                     _mc = self._max_captcha_per_token
                 sign = data["params"]
                 
@@ -1442,7 +1438,7 @@ class beian:
                 logger.info(f"⏱️ check_img成功: auth={(_t_token-_t0)*1000:.0f}ms img={(_t_getimg-_t_token)*1000:.0f}ms match={(_t_match-_t_getimg)*1000:.0f}ms submit={(_t_check-_t_match)*1000:.0f}ms total={_t_total:.0f}ms")
                 # 共享token模式：真实取号成功后立即共享给所有worker（含失效后重取）
                 if self._shared_token_mode:
-                    _exp_ms = ctx.token_expire if ctx else self.token_expire
+                    _exp_ms = ctx.token_expire if ctx else self._credential.token_expire
                     self._shared_cred = (p_uuid, token, sign, dict(base_header), _exp_ms)
                     self._shared_active = True
                 return True, p_uuid, token, sign, base_header
@@ -1456,10 +1452,10 @@ class beian:
                     logger.warning(f"⛔ 连续{ctx.consecutive_fails}次check异常，标记Token强制刷新")
                     ctx.force_refresh = True
             else:
-                self._token_consecutive_fails += 1
-                if self._token_consecutive_fails >= 2:
-                    logger.warning(f"⛔ 连续{self._token_consecutive_fails}次check异常，标记Token强制刷新")
-                    self._token_force_refresh = True
+                self._credential.consecutive_fails += 1
+                if self._credential.consecutive_fails >= 2:
+                    logger.warning(f"⛔ 连续{self._credential.consecutive_fails}次check异常，标记Token强制刷新")
+                    self._credential.force_refresh = True
             logger.info(f"⏱️ check_img失败-异常: total={(time.time()-_t0)*1000:.0f}ms")
             return False, str(e), '', '', ''
 
@@ -1509,7 +1505,7 @@ class beian:
                 if (self._batch_mode and self._sticky_ipv6 is not None
                         and self._get_ip_state(self._sticky_ipv6).request_count >= self._queries_per_ip):
                     self._sticky_ipv6 = None
-                    self._token_force_refresh = True
+                    self._credential.force_refresh = True
                 if self._sticky_ipv6 is None and not proxy and self.local_ipv6_addresses:
                     self._sticky_ipv6 = await self._get_ipv6_sticky()
                 ipv6 = self._sticky_ipv6
@@ -1537,7 +1533,7 @@ class beian:
                         ctx.force_refresh = True
                         ctx.ipv6 = await self._get_ipv6_sticky()
                     else:
-                        self._token_force_refresh = True
+                        self._credential.force_refresh = True
                         self._sticky_ipv6 = None
                     continue
 
@@ -1695,7 +1691,7 @@ class beian:
             if (self._batch_mode and self._sticky_ipv6 is not None
                     and self._get_ip_state(self._sticky_ipv6).request_count >= self._queries_per_ip):
                 self._sticky_ipv6 = None
-                self._token_force_refresh = True
+                self._credential.force_refresh = True
             if self._sticky_ipv6 is None and not proxy and self.local_ipv6_addresses:
                 self._sticky_ipv6 = await self._get_ipv6_sticky()
             ipv6 = self._sticky_ipv6
@@ -1712,7 +1708,7 @@ class beian:
                         continue
                     # 验证码/Token失败 → 强制刷新Token + 切换IP重试
                     logger.warning(f"🔄 打码失败（{err_msg[:50]}），刷新Token+切换IP重试 ({ip_attempt+1}/{max_ip_retries})")
-                    self._token_force_refresh = True
+                    self._credential.force_refresh = True
                     self._sticky_ipv6 = None
                     continue
 
