@@ -596,11 +596,7 @@ class beian:
         # 替代原先单一的 self._ip_queries_used，避免不同任务共享同一计数器。
         self._ip_states: dict = {}
 
-        # === 验证码预取池（已禁用：改为每个查询独立打码） ===
-        self._captcha_pool = asyncio.Queue(maxsize=10)
-        self._captcha_filler_running = False
-        self._captcha_filler_tasks = []
-        self._captcha_filler_count = 0   # 禁用填充器
+        # 验证码改为每个查询独立内联打码（预取池/填充器已移除，避免死代码）
         
         # === Token 获取专用锁（防止并发重复auth） ===
         self._token_fetch_lock = asyncio.Lock()
@@ -676,97 +672,6 @@ class beian:
         self._shared_consumed = set()
         self._shared_active = False
 
-    # === 验证码预取池：后台持续打码 ===
-    async def _captcha_filler(self):
-        """后台任务：持续预取验证码，保持池满"""
-        logger.info(f"🔧 验证码预取池启动 (容量={self._captcha_pool_size})")
-        self._captcha_filler_running = True
-        while self._captcha_filler_running:
-            try:
-                if self._captcha_pool.full():
-                    await asyncio.sleep(0.05)
-                    continue
-                
-                # 检查Token是否需要轮换
-                if self._token_captcha_count >= self._max_captcha_per_token:
-                    self._token_force_refresh = True
-                
-                # 预取使用独立IP轮换（不干扰查询的粘性IP）
-                ipv6 = await self._get_next_ipv6() if self.local_ipv6_addresses else None
-                
-                # 获取token
-                success, token, base_header = await self.get_token(ipv6=ipv6)
-                if not success:
-                    await asyncio.sleep(0.3)
-                    continue
-                
-                # 获取验证码图片
-                data = self.get_clientUid()
-                h = base_header.copy()
-                h["token"] = token
-                h["Content-Type"] = "application/json"
-                
-                try:
-                    async with self.get_session(ipv6=ipv6) as session:
-                        async with session.post(self.getCheckImage, data=data, headers=h) as req:
-                            res = await req.json()
-                except BaseException:
-                    await asyncio.sleep(0.2)
-                    continue
-                
-                p_uuid = res["params"]["uuid"]
-                big_image = res["params"]["bigImage"]
-                small_image = res["params"]["smallImage"]
-                
-                # 滑块匹配
-                match_success, offset_x = self.match_slider_offset(small_image, big_image)
-                if not match_success:
-                    await asyncio.sleep(0.05)
-                    continue
-                
-                # 提交验证码
-                check_data = ujson.dumps({"key": p_uuid, "value": str(offset_x)})
-                h["Content-Length"] = str(len(check_data.encode("utf-8")))
-                
-                try:
-                    async with self.get_session(ipv6=ipv6) as session:
-                        async with session.post(self.checkImage, data=check_data, headers=h) as req:
-                            text = await req.text()
-                            data_resp = ujson.loads(text)
-                except BaseException:
-                    continue
-                
-                if not data_resp.get("success", False):
-                    continue
-                
-                sign = data_resp["params"]
-                
-                # 成功！放入预取池
-                captcha_item = (p_uuid, token, sign, base_header)
-                try:
-                    self._captcha_pool.put_nowait(captcha_item)
-                    self._token_captcha_count += 1
-                    pool_size = self._captcha_pool.qsize()
-                    if pool_size % 5 == 0:
-                        logger.info(f"📦 预取池: {pool_size}/{self._captcha_pool_size} 个验证码就绪")
-                except asyncio.QueueFull:
-                    pass
-                
-            except BaseException as e:
-                logger.debug(f"验证码预取异常: {e}")
-                await asyncio.sleep(0.3)
-        
-        logger.info("验证码预取池已停止")
-    
-    def _ensure_filler_running(self):
-        """确保预取后台任务在运行（启动多个并发filler）"""
-        if not self._captcha_filler_running:
-            self._captcha_filler_running = True
-            for i in range(self._captcha_filler_count):
-                task = asyncio.ensure_future(self._captcha_filler())
-                self._captcha_filler_tasks.append(task)
-            logger.info(f"🔧 启动 {self._captcha_filler_count} 个验证码预取worker")
-    
     async def _add_blocked_ip(self, ip, cooldown=90):
         """异步添加 IP 到黑名单缓存（支持冷却秒数，到期自动释放）
         
@@ -1385,17 +1290,6 @@ class beian:
                 return await self.check_img(
                     proxy=proxy, ipv6=ipv6, ctx=ctx, _skip_shared=True,
                 )
-        
-        # === 验证码预取池：非阻塞尝试，池空则走正常流程 ===
-        self._ensure_filler_running()
-        try:
-            captcha_item = self._captcha_pool.get_nowait()
-            p_uuid, token, sign, base_header = captcha_item
-            base_header["Content-Type"] = "application/json"
-            logger.debug(f"📦 从预取池取出验证码 (池剩余: {self._captcha_pool.qsize()})")
-            return True, p_uuid, token, sign, base_header
-        except asyncio.QueueEmpty:
-            pass  # 池空，走正常打码流程
         
         # === Token 轮换：检查是否需要主动刷新 ===
         _captcha_count = ctx.captcha_count if ctx else self._token_captcha_count
@@ -3367,12 +3261,6 @@ class beian:
 
     async def cleanup(self):
         """清理资源"""
-        # 停止验证码预取后台任务
-        self._captcha_filler_running = False
-        for task in self._captcha_filler_tasks:
-            if not task.done():
-                task.cancel()
-        self._captcha_filler_tasks.clear()
         # 关闭 session 池中的所有连接
         if hasattr(self, '_session_close_tasks'):
             for task in list(self._session_close_tasks):
