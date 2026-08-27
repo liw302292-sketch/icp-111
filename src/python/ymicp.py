@@ -1005,9 +1005,8 @@ class beian:
         """从池中获取或创建 session；整个进程生命周期内按出口复用。"""
         self._init_session_pool()
 
+        # 选 IP 的唯一入口在 get_session()，这里只负责按传入的出口复用 session
         local_ipv6 = ipv6
-        if not local_ipv6 and not proxy and self.local_ipv6_addresses:
-            local_ipv6 = await self._get_next_ipv6()
 
         key = (proxy or "", local_ipv6 or "__default__")
 
@@ -1051,12 +1050,12 @@ class beian:
                 and (ipv6 is None or (isinstance(ipv6, str) and ipv6.startswith("tunnel-")))):
             proxy = self._tunnel_url
             ipv6 = None
+        # 唯一选 IP 的入口：get_session 负责解析出口，_get_session_from_pool 不再自行选择。
+        if not proxy and ipv6 is None and self.local_ipv6_addresses:
+            ipv6 = await self._get_next_ipv6()
         session = await self._get_session_from_pool(proxy, ipv6=ipv6)
-        local_ipv6 = ipv6
-        if not local_ipv6 and not proxy and self.local_ipv6_addresses:
-            local_ipv6 = await self._get_next_ipv6()
-        if local_ipv6:
-            logger.debug(f"使用本地 IPv6 地址：{local_ipv6}")
+        if ipv6:
+            logger.debug(f"使用本地 IPv6 地址：{ipv6}")
         try:
             yield session
         except GeneratorExit:
