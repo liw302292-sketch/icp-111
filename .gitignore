@@ -37,6 +37,7 @@ airport_clash/
 *.tmp
 php_ui/
 batch_results/
+bench_results/
 docker_*.log
 src/python/ymicp.py.bak.*
 ymicp.py.*.bak
