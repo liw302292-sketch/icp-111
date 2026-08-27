@@ -31,13 +31,7 @@ echo.
 :: ============================================
 echo [1/2] Check existing IPv6 addresses...
 
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$existing = (Get-NetIPAddress -AddressFamily IPv6 | Where-Object { $_.PrefixOrigin -eq 'Manual' -and $_.IPAddress -notmatch '^fe80:' }).Count;" ^
-    "if ($existing -gt 0) {" ^
-    "    Write-Host \"  Found $existing IPv6 addresses, will reuse directly\";" ^
-    "} else {" ^
-    "    Write-Host '  No existing IPv6 found, will create on startup';" ^
-    "}"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0check_ipv6.ps1"
 
 echo.
 
@@ -45,6 +39,13 @@ echo.
 ::  第二步：启动ICP查询服务
 :: ============================================
 echo [2/2] Start ICP query service...
+
+:: ============================================
+::  手机USB网络自动补IPv6（插手机后自动添加300个地址）
+:: ============================================
+echo [2.1] Ensure phone IPv6 addresses...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0add_phone_ips.ps1"
+echo.
 
 :: 检查Python
 where python >nul 2>&1

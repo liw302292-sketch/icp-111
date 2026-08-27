@@ -4,13 +4,15 @@ system:
   http_client_timeout: 30
   web_ui: true
   detail_concurrency: 10
-  batch_workers: 24  # 流式批量并发IP数（实测24并发≈19q/s且0硬429）
-  ip_query_concurrency: 1  # 同一IP并发查询数（实测必须为1，防突发限流）
-  ip_query_interval: 0.5  # 同一IP查询发送间隔（秒，实测0.5s安全）
+  batch_workers: 24  # 回到验证过的稳定档；加并发会让新/64的403被放大
+  ip_query_concurrency: 1  # 每IP串行，避免挑战页被并发触发
+  ip_query_interval: 0.5  # 每IP间隔，稳定档
   token_query_cap: 60  # 每个IP独立token窗口内最多查询条数
   ip_queries_per_rotation: 15  # 同一IP在窗口内连续查询条数后轮换IP
-  max_requeue_attempts: 10  # 单个域名被限流后的最大延迟重试次数（指数退避）
+  max_requeue_attempts: 3  # 单个域名被限流后的最大延迟重试次数（降低重试风暴）
   enable_stream_batch: true  # 多IP流式批量（共享token窗口 + 多IP轮换，429自动换IP）
+  shared_token_batch: false  # 单IP独立token；共享token实测不提升反而更慢
+  shared_queries_per_ip: 30  # 共享模式下每IP查询数（低于WAF硬化阈值，保留备用）
 captcha:
   enable: true
   save_failed_img: false

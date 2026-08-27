@@ -29,6 +29,11 @@ except ImportError:
 
 routes = web.RouteTableDef()
 
+try:
+    MAX_BATCH_SIZE = int(getattr(config, "system", None) and getattr(config.system, "max_batch_size", 0) or 1000000)
+except (TypeError, ValueError):
+    MAX_BATCH_SIZE = 1000000
+
 
 def _failure_status(result):
     """Map an upstream failure to a stable, user-visible outcome."""
@@ -297,7 +302,7 @@ async def create_task(taskname, data, request, searnum, apptype="web", token_poo
                  and myicp.local_ipv6_addresses)
     
     if use_batch:
-        QUERIES_PER_IP = getattr(getattr(config, 'captcha', object()), 'queries_per_ip', 20)
+        QUERIES_PER_IP = getattr(getattr(config, 'captcha', object()), 'queries_per_ip', 20) or 20
         
         # 🔥 每次批量任务前刷新IPv6地址列表（防止前缀变更后地址过期）
         myicp.refresh_ipv6_addresses()
@@ -480,7 +485,7 @@ async def querytask(request):
                     reg.append(d)
                 else:
                     unreg.append(d)
-            result_data = reg + unreg[-50:]
+            result_data = reg[-500:] + unreg[-50:]
         
         return wj({
                 "code": 200,
@@ -522,8 +527,8 @@ async def create_task_catch(request):
             return wj({"code": 400, "message": "data must be a non-empty array"}, status=400)
         if any(not isinstance(item, str) or not item.strip() for item in domains):
             return wj({"code": 400, "message": "every data item must be a non-empty string"}, status=400)
-        if len(domains) > 100000:
-            return wj({"code": 400, "message": "batch size exceeds 100000"}, status=400)
+        if len(domains) > MAX_BATCH_SIZE:
+            return wj({"code": 400, "message": f"batch size exceeds {MAX_BATCH_SIZE}"}, status=400)
         domains = list(dict.fromkeys(item.strip() for item in domains))
 
         if seartype not in config.risk_avoidance.allow_type:
@@ -541,9 +546,14 @@ async def create_task_catch(request):
             searnum = int(data.get("querynum", 1))
         except (TypeError, ValueError):
             return wj({"code": 400, "message": "querynum must be an integer"}, status=400)
-        # MIIT has actively rate-limited this deployment.  A single compliant
-        # worker prevents callers from recreating the failed high-burst mode.
-        searnum = max(1, min(searnum, 1))
+        # 并发受 config.system.batch_concurrency 控制（默认10），
+        # 仅当配置了 tunnel 代理时才放开并发；本地直连强制单worker，避免突发封禁。
+        _tunnel = getattr(getattr(config, "proxy", None), "tunnel", None)
+        if _tunnel is not None and getattr(_tunnel, "url", None):
+            _batch_concurrency = int(getattr(getattr(config, "system", None), "batch_concurrency", 0) or 10)
+        else:
+            _batch_concurrency = 1
+        searnum = max(1, min(searnum, _batch_concurrency))
         
         # 检查是否已存在同名任务
         if taskname in request.app["tasks"]:

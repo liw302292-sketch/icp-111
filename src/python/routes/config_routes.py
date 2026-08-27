@@ -75,6 +75,79 @@ def _merge_auth_users(users_in):
     return result
 
 
+def _merge_preserved_tuning(config_dict, data):
+    """保留并合并新增的调优字段，避免 Web 保存后静默丢失这些配置。"""
+    try:
+        import yaml
+        cfg_path = get_resource_path("config.yml")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            existing = yaml.safe_load(f) or {}
+    except Exception:
+        existing = {}
+
+    es = existing.get("system") or {}
+    ec = existing.get("captcha") or {}
+    ep = existing.get("proxy") or {}
+    et = (ep.get("tunnel") or {}) if isinstance(ep, dict) else {}
+    ds = data.get("system") or {}
+    dc = data.get("captcha") or {}
+    dp = data.get("proxy") or {}
+    dt = (dp.get("tunnel") or {}) if isinstance(dp, dict) else {}
+
+    int_keys = [
+        "batch_workers", "ip_query_concurrency", "token_query_cap",
+        "ip_queries_per_rotation", "shared_queries_per_ip", "max_requeue_attempts",
+        "token_prefetch_count", "captcha_concurrency", "max_batch_size",
+        "batch_concurrency", "global_query_rate",
+    ]
+    bool_keys = ["shared_token_batch", "enable_stream_batch"]
+    for k in int_keys:
+        if k not in config_dict["system"]:
+            raw = ds.get(k, es.get(k))
+            if raw is None:
+                config_dict["system"][k] = None
+            else:
+                try:
+                    config_dict["system"][k] = int(raw)
+                except (TypeError, ValueError):
+                    config_dict["system"][k] = raw
+    for k in bool_keys:
+        if k not in config_dict["system"]:
+            raw = ds.get(k, es.get(k))
+            config_dict["system"][k] = bool(raw) if raw is not None else None
+    if "ip_query_interval" not in config_dict["system"]:
+        raw = ds.get("ip_query_interval", es.get("ip_query_interval"))
+        try:
+            config_dict["system"]["ip_query_interval"] = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            config_dict["system"]["ip_query_interval"] = raw
+    if "query_http_client" not in config_dict["system"]:
+        raw = ds.get("query_http_client", es.get("query_http_client"))
+        config_dict["system"]["query_http_client"] = str(raw) if raw is not None else None
+
+    for k in ("max_per_token", "queries_per_ip"):
+        if k not in config_dict["captcha"]:
+            raw = dc.get(k, ec.get(k))
+            if raw is None:
+                config_dict["captcha"][k] = None
+            else:
+                try:
+                    config_dict["captcha"][k] = int(raw)
+                except (TypeError, ValueError):
+                    config_dict["captcha"][k] = raw
+
+    config_dict["proxy"]["tunnel"]["enable"] = bool(
+        dt.get("enable", et.get("enable", False))
+    )
+    try:
+        config_dict["proxy"]["tunnel"]["batch_slots"] = int(
+            dt.get("batch_slots", et.get("batch_slots", 0)) or 0
+        )
+    except (TypeError, ValueError):
+        config_dict["proxy"]["tunnel"]["batch_slots"] = 0
+    return config_dict
+
+
 @jsondump
 @routes.view(r"/config")
 async def get_config(request):
@@ -86,13 +159,30 @@ async def get_config(request):
                 "port": config.system.port,
                 "http_client_timeout": config.system.http_client_timeout,
                 "web_ui": config.system.web_ui,
-                "detail_concurrency": config.system.detail_concurrency
+                "detail_concurrency": config.system.detail_concurrency,
+                "batch_workers": config.system.batch_workers,
+                "ip_query_concurrency": config.system.ip_query_concurrency,
+                "ip_query_interval": config.system.ip_query_interval,
+                "token_query_cap": config.system.token_query_cap,
+                "ip_queries_per_rotation": config.system.ip_queries_per_rotation,
+                "shared_token_batch": config.system.shared_token_batch,
+                "shared_queries_per_ip": config.system.shared_queries_per_ip,
+                "query_http_client": config.system.query_http_client,
+                "max_requeue_attempts": config.system.max_requeue_attempts,
+                "enable_stream_batch": config.system.enable_stream_batch,
+                "token_prefetch_count": config.system.token_prefetch_count,
+                "captcha_concurrency": config.system.captcha_concurrency,
+                "max_batch_size": config.system.max_batch_size,
+                "batch_concurrency": config.system.batch_concurrency,
+                "global_query_rate": config.system.global_query_rate,
             },
             "captcha": {
                 "enable": config.captcha.enable,
                 "save_failed_img": config.captcha.save_failed_img,
                 "save_failed_img_path": config.captcha.save_failed_img_path,
-                "retry_times": config.captcha.retry_times
+                "retry_times": config.captcha.retry_times,
+                "max_per_token": config.captcha.max_per_token,
+                "queries_per_ip": config.captcha.queries_per_ip,
             },
             "proxy": {
                 "local_ipv6_pool": {
@@ -102,7 +192,9 @@ async def get_config(request):
                     "ipv6_network_card": config.proxy.local_ipv6_pool.ipv6_network_card
                 },
                 "tunnel": {
-                    "url": config.proxy.tunnel.url or ""
+                    "url": config.proxy.tunnel.url or "",
+                    "enable": bool(getattr(config.proxy.tunnel, "enable", False)),
+                    "batch_slots": int(getattr(config.proxy.tunnel, "batch_slots", 0) or 0),
                 },
                 "extra_api": {
                     "url": config.proxy.extra_api.url or "",
@@ -216,6 +308,7 @@ async def save_config(request):
                 },
             }
 
+            config_dict = _merge_preserved_tuning(config_dict, data)
             config_dict = maybe_hash_users_in_config_dict(config_dict)
 
             # 备份原配置文件

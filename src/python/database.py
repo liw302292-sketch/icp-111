@@ -431,3 +431,28 @@ class Database:
             except Exception as e:
                 logger.error(f"删除批量任务失败：{e}")
                 return False
+
+    def recover_stale_batch_tasks(self, status='interrupted'):
+        """把进程崩溃/重启后遗留的 running 任务标记为中断，避免僵尸记录累积。
+
+        返回被标记的任务数量。
+        """
+        with self._lock:
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                now_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                cursor.execute('''
+                UPDATE batch_task_history
+                SET status = ?, finish_time = ?
+                WHERE status = 'running'
+                ''', (status, now_local))
+                affected = cursor.rowcount
+                conn.commit()
+                conn.close()
+                if affected:
+                    logger.info(f"已将 {affected} 个遗留 running 批量任务标记为 {status}")
+                return affected
+            except Exception as e:
+                logger.error(f"标记遗留批量任务失败：{e}")
+                return 0

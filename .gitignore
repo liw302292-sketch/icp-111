@@ -30,3 +30,14 @@ model_data/
 打包/
 nuitka-crash-report.xml
 icpApi.exe
+airport_clash/
+
+# 调试/备份/临时产物（不提交）
+*.bak
+*.tmp
+php_ui/
+batch_results/
+docker_*.log
+src/python/ymicp.py.bak.*
+ymicp.py.*.bak
+config.yml.*-bak

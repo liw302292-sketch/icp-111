@@ -7,11 +7,13 @@ import asyncio
 import random
 import time
 import socket
+import os
+import subprocess as sp
 import aiohttp
 from typing import List, Optional
 from mlog import logger
 from load_config import config
-from utils import get_local_ipv6_addresses, configure_ipv6_addresses, is_public_ipv6, check_has_permanent_ipv6
+from utils import get_local_ipv6_addresses, get_manual_ipv6_addresses, configure_ipv6_addresses, is_public_ipv6, check_has_permanent_ipv6
 
 
 class IPv6AddressPool:
@@ -27,7 +29,11 @@ class IPv6AddressPool:
         self.network_card = config.proxy.local_ipv6_pool.ipv6_network_card
         self._maintenance_task = None
         self._last_prefix = None  # 记录上次的IPv6前缀
+        self._last_prefixes = set()  # 当前确认可用的所有 /64 前缀
         self._on_change_callbacks = []  # 地址变更回调列表（如通知beian刷新）
+        self._last_add_fail_time = 0.0  # 补池失败退避时间戳
+        self._pending_replacements = set()  # 正在后台替换的地址
+        self._replacement_tasks = set()  # 后台替换任务引用，防止被GC
         
     def add_change_callback(self, callback):
         """注册地址变更回调（如 beian.refresh_ipv6_addresses）"""
@@ -42,11 +48,11 @@ class IPv6AddressPool:
             except Exception as e:
                 logger.warning(f"地址变更回调失败: {e}")
     
-    async def _discover_working_prefix(self) -> Optional[str]:
+    async def _discover_working_prefixes(self) -> List[str]:
         """
-        探测哪个/64前缀真正可达。
-        系统上可能有多个不同前缀的IPv6（比如云商切换了子网），
-        需要找出真正能连通公网的那个。
+        探测哪些 /64 前缀真正可达。
+        系统上可能有多个不同前缀的 IPv6（家宽 + 手机 USB 网络等），
+        所有可达前缀都应保留，供查询 worker 分散出口使用。
         """
         # 按 /64 前缀分组
         prefix_groups: dict[str, list[str]] = {}
@@ -56,7 +62,7 @@ class IPv6AddressPool:
         
         if len(prefix_groups) <= 1:
             # 只有一个前缀，直接返回
-            return list(prefix_groups.keys())[0] if prefix_groups else None
+            return list(prefix_groups.keys())
         
         logger.info(f"检测到 {len(prefix_groups)} 个不同的IPv6前缀，开始探测可用性...")
         
@@ -82,32 +88,70 @@ class IPv6AddressPool:
             logger.warning(f"清理失效前缀 {dead_pfx}::/64 的 {len(dead_addrs)} 个地址...")
             await self._remove_dead_addresses(dead_addrs)
         
-        # 返回第一个可用前缀
-        chosen_pfx, chosen_addrs = working_prefixes[0]
-        logger.info(f"选择可用前缀: {chosen_pfx}::/64")
-        
-        # 如果有多个可用前缀，记录警告
-        if len(working_prefixes) > 1:
-            logger.warning(f"存在多个可用前缀，将使用 {chosen_pfx}::/64")
-        
-        return chosen_pfx
+        chosen = [pfx for pfx, _ in working_prefixes]
+        logger.info(f"选择可用前缀: {', '.join(f'{p}::/64' for p in chosen)}")
+        return chosen
     
     async def _remove_dead_addresses(self, addresses: list[str]):
         """从系统中移除失效的IPv6地址"""
-        import subprocess as sp
-        removed = 0
-        for addr in addresses:
+        if not addresses:
+            return
+
+        async def delete_one(addr):
             try:
-                sp.run([
-                    "netsh", "interface", "ipv6", "delete", "address",
-                    self.network_card, addr
-                ], stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=5)
-                removed += 1
+                await asyncio.to_thread(
+                    sp.run,
+                    [
+                        "netsh", "interface", "ipv6", "delete", "address",
+                        self.network_card, addr,
+                    ],
+                    stdout=sp.DEVNULL,
+                    stderr=sp.DEVNULL,
+                    timeout=5,
+                )
+                return addr
             except Exception:
-                pass
+                return None
+
+        # 系统级地址删除是真正慢且占资源的地方，限制并发到 8，
+        # 避免像一次性 5000+ 删除那样把网卡状态机打满。
+        sem = asyncio.Semaphore(8)
+
+        async def limited(addr):
+            async with sem:
+                return await delete_one(addr)
+
+        results = await asyncio.gather(*(limited(addr) for addr in addresses))
+        removed = [r for r in results if r]
         if removed:
-            logger.info(f"已从系统清理 {removed} 个失效IPv6地址")
+            logger.info(f"已从系统清理 {len(removed)} 个失效IPv6地址")
             await self._refresh_system_addresses()
+
+    async def _trim_system_managed_addresses(self):
+        """把系统网卡上的手工 IPv6 地址同步到 active_addresses 上限。
+
+        这是修复“任务运行后网卡上不断堆积、却不删除旧地址”的关键。
+        只删 Manual/手动地址，保留路由器公告的 Public/Temporary 基础地址。
+        """
+        keep = set(self.active_addresses.keys())
+        managed = await asyncio.to_thread(
+            get_manual_ipv6_addresses, self.network_card
+        )
+        # 保护：只有手工地址数量真正超过活跃池上限时才清理，
+        # 避免“系统/活跃数量相等但集合不完全一致”时每轮删一个地址造成的抖动。
+        # 只有手工地址明显超过活跃池（+2 冗余）时才清理，
+        # 防止系统/活跃集合仅轻微不一致时每轮都删一个地址。
+        if len(managed) <= len(keep) + 2:
+            return
+        # 只删本程序当前能看见的系统地址，避免误伤其它网卡。
+        system_set = set(self.system_addresses)
+        to_delete = [addr for addr in managed
+                     if addr in system_set and addr not in keep]
+        if not to_delete:
+            return
+        logger.info(f"🧹 检测到系统中有 {len(managed)} 个手工IPv6地址，"
+                    f"活动池仅保留 {len(keep)} 个，准备清理 {len(to_delete)} 个多余地址")
+        await self._remove_dead_addresses(to_delete)
     
     async def initialize(self):
         """初始化地址池"""
@@ -132,14 +176,15 @@ class IPv6AddressPool:
             logger.warning("⚠️  或在云服务商控制台中为您的实例分配和绑定IPv6地址段")
             logger.warning("=" * 80)
         
-        # 🔧 自动探测可用前缀（支持多前缀环境，自动切换到可达的那个）
-        working_prefix = await self._discover_working_prefix()
-        if not working_prefix:
+        # 🔧 自动探测可用前缀（支持多前缀环境，保留所有可达出口）
+        working_prefixes = await self._discover_working_prefixes()
+        if not working_prefixes:
             logger.error("未找到任何可达的IPv6前缀，无法启用IPv6池")
             return False
         
-        self._last_prefix = working_prefix
-        logger.info(f"使用IPv6前缀: {self._last_prefix}")
+        self._last_prefixes = set(working_prefixes)
+        self._last_prefix = working_prefixes[0]
+        logger.info(f"使用IPv6前缀: {', '.join(f'{p}::/64' for p in working_prefixes)}")
         
         # 验证现有地址的可用性
         logger.info(f"开始验证 {len(self.system_addresses)} 个系统IPv6地址的可用性...")
@@ -181,6 +226,14 @@ class IPv6AddressPool:
         if verified_count == 0:
             logger.error("没有任何可用的公网IPv6地址，无法启用IPv6池")
             return False
+
+        # 池容量裁剪：系统地址可能多于 pool_num（如历史遗留604个、现在配300），
+        # 随机保留 pool_num 个，让每次任务的出口集合可控。
+        self._cap_pool()
+
+        # 只裁剪 Python 字典是不够的，必须把系统网卡上多余的手工地址真正删掉，
+        # 否则旧任务会无限累积 IPv6，最终拖垮本机网络栈。
+        await self._trim_system_managed_addresses()
         
         # 如果地址数量不足，自动补充
         if len(self.active_addresses) < self.pool_size:
@@ -188,15 +241,45 @@ class IPv6AddressPool:
             logger.info(f"当前有 {len(self.active_addresses)} 个可用IPv6地址，需要补充 {needed} 个")
             await self._add_addresses(needed)
         else:
-            logger.info(f"已有 {len(self.active_addresses)} 个可用IPv6地址，满足需求")
+            logger.info(f"已有 {len(self.active_addresses)} 个可用IPv6地址，满足需求(池上限{self.pool_size})")
         
         # 启动维护任务
         await self.start_maintenance()
         return True
+
+    def _cap_pool(self):
+        """把活跃池裁剪到 pool_size 以内。
+        优先保留小前缀（如手机/其他运营商的独立出口，通常只有1~2个地址），
+        剩余名额从最大前缀随机补足。供初始化/前缀变化/维护时调用。"""
+        if len(self.active_addresses) <= self.pool_size:
+            return
+        groups = {}
+        for k in self.active_addresses:
+            pfx = ":".join(k.split(":")[:4])
+            groups.setdefault(pfx, []).append(k)
+        import random as _random
+        keep = []
+        # 小前缀优先全保留（独立出口，丢了就少一个窗口）
+        for pfx, addrs in sorted(groups.items(), key=lambda x: len(x[1])):
+            if len(keep) + len(addrs) <= self.pool_size:
+                keep.extend(addrs)
+            else:
+                break
+        # 剩余名额从最大前缀随机补足
+        remaining = self.pool_size - len(keep)
+        if remaining > 0:
+            big = max(groups.items(), key=lambda x: len(x[1]))[1]
+            _random.shuffle(big)
+            keep.extend(big[:remaining])
+        keep_set = set(keep)
+        removed = [k for k in self.active_addresses if k not in keep_set]
+        self.active_addresses = {k: self.active_addresses[k] for k in keep}
+        logger.info(f"✂️ IPv6池裁剪: {len(keep)+len(removed)} -> {len(keep)} "
+                    f"(保留前缀数{len(groups)}个，移除{len(removed)}个，池上限{self.pool_size})")
     
     async def _refresh_system_addresses(self):
         """刷新系统中实际存在的IPv6地址"""
-        all_addresses = get_local_ipv6_addresses()
+        all_addresses = await asyncio.to_thread(get_local_ipv6_addresses)
         self.system_addresses = [addr for addr in all_addresses if is_public_ipv6(addr)]
         logger.debug(f"系统中有 {len(self.system_addresses)} 个公网IPv6地址")
     
@@ -252,15 +335,24 @@ class IPv6AddressPool:
 
         logger.info(f"尝试添加 {count} 个IPv6地址...")
         added = 0
-        max_attempts = count * 3  # 最多尝试次数（考虑到可能有失败的）
+        # 不要为了补几百个地址同步空转；每次只小批量补，失败就退避。
+        # 扩大尝试次数与失败容忍，给 DAD(重复地址检测) 留足时间，
+        # 否则新增 IPv6 在短暂 Tentative 状态会被误判为“未检测到”而提前放弃。
+        max_attempts = min(max(1, count * 2), 200)
         attempts = 0
+        consecutive_fail = 0
 
         while added < count and attempts < max_attempts:
             attempts += 1
             try:
                 # 生成新地址
-                configure_ipv6_addresses(self._last_prefix, 1, self.network_card)
-                await asyncio.sleep(0.5)  # 等待系统应用配置
+                await asyncio.to_thread(
+                    configure_ipv6_addresses,
+                    self._last_prefix,
+                    1,
+                    self.network_card,
+                )
+                await asyncio.sleep(0.2)  # 等待系统应用配置
 
                 # 重新获取系统地址
                 old_system_addresses = set(self.system_addresses)
@@ -270,6 +362,7 @@ class IPv6AddressPool:
                 new_addresses = set(self.system_addresses) - old_system_addresses - set(self.active_addresses.keys())
 
                 if new_addresses:
+                    consecutive_fail = 0
                     for new_addr in new_addresses:
                         # 只要本地存在且为公网地址就直接加入池
                         if is_public_ipv6(new_addr):
@@ -280,14 +373,18 @@ class IPv6AddressPool:
                         else:
                             logger.warning(f"新添加的IPv6地址不是公网地址: {new_addr}")
                 else:
+                    consecutive_fail += 1
                     logger.warning(f"添加IPv6地址可能失败，未检测到新地址（尝试 {attempts}/{max_attempts}）")
+                    if consecutive_fail >= 20:
+                        logger.warning("连续多次未检测到新IPv6地址，暂停补池，避免空转")
+                        break
 
             except Exception as e:
                 logger.error(f"添加IPv6地址时出错: {e}")
 
             # 如果还需要继续添加，短暂等待
             if added < count:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.2)
 
         logger.info(f"添加完成：成功 {added}/{count} 个，共尝试 {attempts} 次")
         return added
@@ -313,42 +410,110 @@ class IPv6AddressPool:
                 logger.info(f"清理了 {len(invalid_addresses)} 个失效的IPv6地址")
             
             return len(invalid_addresses)
+
+    async def replace_blocked_address(self, addr: str) -> Optional[str]:
+        """安排后台替换被封地址（不阻塞查询热路径）。
+
+        当上游把某个 IP 拉黑 30 分钟时，继续保留该地址只会让固定大小的
+        IPv6 池慢慢耗尽，最终所有 worker 都在“等待 IP 恢复”中空转。
+        策略：立即返回，后台先补一个新地址，补成功后才删除被封地址；
+        补失败（如权限不足）则保留旧地址仅做冷却标记，等30分钟自然恢复，
+        池子容量不受损，也不会让查询线程干等。
+        """
+        if not addr:
+            return None
+        if addr not in self.active_addresses or addr in self._pending_replacements:
+            return None
+        # 补池失败后退避30秒，避免大量429瞬间触发后台任务风暴
+        if time.time() - self._last_add_fail_time < 30:
+            return None
+        # 限制并发替换任务数（查询消耗快，提高并行度避免池缩水）
+        if len(self._replacement_tasks) >= 8:
+            return None
+        self._pending_replacements.add(addr)
+        task = asyncio.create_task(self._do_replace_blocked(addr))
+        self._replacement_tasks.add(task)
+        task.add_done_callback(self._replacement_tasks.discard)
+        return None
+
+    async def _do_replace_blocked(self, addr: str):
+        """后台执行替换：先补新地址，成功后再删除被封地址。"""
+        try:
+            async with self.lock:
+                if addr not in self.active_addresses:
+                    return
+                old_active = set(self.active_addresses.keys())
+                added = await self._add_addresses(1)
+                if added <= 0:
+                    # 补失败：保留旧地址，等30分钟冷却自然恢复，池容量不缩水
+                    self._last_add_fail_time = time.time()
+                    logger.warning(f"⚠️ 补充IPv6失败，暂不删除被封地址: {addr[-12:]}")
+                    return
+                fresh = set(self.active_addresses.keys()) - old_active
+                new_addr = next(iter(fresh), None)
+
+                # 补成功后才删除被封地址
+                self.active_addresses.pop(addr, None)
+                try:
+                    if os.name == 'nt':
+                        await asyncio.to_thread(
+                            sp.run,
+                            [
+                                "netsh", "interface", "ipv6", "delete", "address",
+                                self.network_card, addr,
+                            ],
+                            stdout=sp.DEVNULL,
+                            stderr=sp.DEVNULL,
+                            timeout=5,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            sp.run,
+                            ["ip", "-6", "addr", "del", addr, "dev", self.network_card],
+                            stdout=sp.DEVNULL,
+                            stderr=sp.DEVNULL,
+                            timeout=5,
+                        )
+                except Exception as e:
+                    logger.warning(f"删除被封IPv6地址失败(不影响继续): {addr} - {e}")
+                await self._refresh_system_addresses()
+                await self._notify_change()
+                self._last_add_fail_time = 0.0
+                logger.info(
+                    f"♻️ 已替换被封IPv6: {addr[-12:]} -> "
+                    f"{new_addr[-12:] if new_addr else '无'}"
+                )
+        except Exception as e:
+            logger.warning(f"后台替换被封IPv6失败: {addr[-12:]} - {e}")
+        finally:
+            self._pending_replacements.discard(addr)
     
     async def _check_prefix_change(self):
-        """检查IPv6前缀是否发生变化（支持多前缀环境）"""
+        """检查系统 IPv6 前缀集合是否变化（只更新元数据，不丢可用前缀）。"""
         if not self.system_addresses:
             return False
         
-        # 按前缀分组，找到系统上当前存在的所有前缀
         prefix_groups: dict[str, list[str]] = {}
         for addr in self.system_addresses:
             pfx = self._extract_prefix(addr)
             prefix_groups.setdefault(pfx, []).append(addr)
         
         current_prefixes = set(prefix_groups.keys())
-        
-        # 如果当前使用的前缀仍在系统中，无需变化
-        if self._last_prefix in current_prefixes:
+        added = current_prefixes - self._last_prefixes
+        removed = self._last_prefixes - current_prefixes
+
+        if not added and not removed:
             return False
-        
-        # 当前前缀不在系统中了，前缀已变化
-        logger.warning(f"检测到IPv6前缀变化: 当前 {self._last_prefix}::/64 已不在系统中")
-        
-        # 从剩余的可用前缀中选一个（优先选第一个）
-        new_prefix = list(current_prefixes)[0]
-        logger.warning(f"切换到新前缀: {new_prefix}::/64")
-        
-        # 清空活跃池
-        old_count = len(self.active_addresses)
-        self.active_addresses.clear()
-        self._last_prefix = new_prefix
-        
-        # 重新添加新前缀的地址
-        for addr in prefix_groups.get(new_prefix, []):
-            self.active_addresses[addr] = time.time()
-        
-        logger.info(f"前缀变化导致清理了 {old_count} 个旧地址，重新加载了 {len(self.active_addresses)} 个地址")
-        
+
+        if added:
+            logger.info(f"检测到新增 IPv6 前缀: {', '.join(f'{p}::/64' for p in added)}")
+        if removed:
+            logger.warning(f"检测到 IPv6 前缀失效: {', '.join(f'{p}::/64' for p in removed)}")
+
+        self._last_prefixes = current_prefixes
+        if self._last_prefix not in current_prefixes:
+            self._last_prefix = sorted(current_prefixes)[0]
+
         # 通知 beian 刷新地址列表
         await self._notify_change()
         return True
@@ -361,13 +526,25 @@ class IPv6AddressPool:
             
             # 2. 检查前缀是否变化
             prefix_changed = await self._check_prefix_change()
+
+            # 2.5 仅当 active 池真的超过上限时才裁剪，避免每秒反复洗牌。
+            self._cap_pool()
+
+            # 系统地址可能因为历史遗留或异常未删干净，每次维护都同步一次。
+            await self._trim_system_managed_addresses()
             
             # 3. 如果地址数量不足，补充新地址
             current_count = len(self.active_addresses)
             if current_count < self.pool_size:
-                needed = self.pool_size - current_count
+                # 每次只补少量，避免单次维护循环同步空转几百次。
+                needed = min(self.pool_size - current_count, 10)
+                # 补池失败后退避30秒，避免权限/环境问题导致每秒重复空转刷日志
+                if time.time() - self._last_add_fail_time < 30:
+                    return
                 logger.info(f"IPv6地址池不足，当前 {current_count}/{self.pool_size}，需要补充 {needed} 个")
                 added = await self._add_addresses(needed)
+                if added == 0:
+                    self._last_add_fail_time = time.time()
                 
                 if added == 0 and current_count == 0:
                     logger.error("无法添加IPv6地址，地址池为空！")
@@ -470,4 +647,3 @@ async def cleanup_ipv6_pool(app):
 def get_ipv6_pool() -> Optional[IPv6AddressPool]:
     """获取全局IPv6地址池实例"""
     return _ipv6_pool
-

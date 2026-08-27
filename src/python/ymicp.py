@@ -19,16 +19,164 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import ssl
 import subprocess
 import locale
+import ipaddress
 from contextlib import asynccontextmanager
+from collections import deque
 from load_config import config
 from cachetools import TTLCache
+from utils import get_project_root
 
 ssl._create_default_https_context = ssl._create_unverified_context()
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# 可选查询引擎：curl_cffi（Chrome TLS/HTTP2 指纹）
+# aiohttp 用的是 Python 自带 TLS 指纹 + HTTP/1.1，创宇盾很容易识别为脚本。
+# curl_cffi impersonate="chrome" 能复刻 Chrome 的 ClientHello 与请求头顺序。
+# 通过 config.system.query_http_client 切换（aiohttp | curl_cffi）。
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+try:
+    from curl_cffi import requests as _cr
+    _CURL_CFFI_OK = True
+except Exception:
+    _cr = None
+    _CURL_CFFI_OK = False
+
+
+class _CffiHeaders:
+    """curl_cffi Headers 适配：提供 aiohttp 风格的 get/getall。
+    curl 会把多个 Set-Cookie 合并成一个逗号串，这里拆回列表。"""
+
+    def __init__(self, headers):
+        self._h = headers
+
+    def get(self, name, default=None):
+        return self._h.get(name, default)
+
+    def getall(self, name, default=None):
+        raw = self._h.get(name)
+        if raw is None:
+            return default if default is not None else []
+        return [p.strip() for p in raw.split(",")]
+
+
+class CffiResponse:
+    """curl_cffi 响应适配：兼容 aiohttp 调用方用法
+    (async with session.post(...) as req; req.status; req.headers.getall; await req.text())。"""
+
+    __slots__ = ("_resp",)
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    @property
+    def status(self):
+        return self._resp.status_code
+
+    @property
+    def headers(self):
+        return _CffiHeaders(self._resp.headers)
+
+    @property
+    def cookies(self):
+        return dict(self._resp.cookies)
+
+    async def text(self):
+        return self._resp.text
+
+    async def json(self):
+        return self._resp.json()
+
+
+class CffiSession:
+    """curl_cffi AsyncSession 适配：与 aiohttp.ClientSession 的用法对齐，
+    支持 interface(绑定IPv6)、proxy(隧道) 与 Chrome 指纹。"""
+
+    def __init__(self, icp, proxy="", ipv6=None):
+        kwargs = {"impersonate": "chrome", "verify": False}
+        try:
+            kwargs["timeout"] = icp.timeout.total if hasattr(icp.timeout, "total") else 30
+        except Exception:
+            kwargs["timeout"] = 30
+        if proxy:
+            kwargs["proxy"] = proxy
+        elif ipv6 and not ipv6.startswith("tunnel-"):
+            kwargs["interface"] = ipv6
+        self._session = _cr.AsyncSession(**kwargs)
+        self._proxy = proxy
+        self._closed = False
+
+    @property
+    def closed(self):
+        return self._closed
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def close(self):
+        try:
+            await self._session.close()
+        except Exception:
+            pass
+        self._closed = True
+
+    def post(self, url, data=None, headers=None, timeout=None, proxy=None, **kw):
+        """与 aiohttp 对齐：返回可 async with 的上下文管理器，
+        进入时真正发起请求（aiohttp 的 session.post 也是这种形态）。"""
+        return _CffiPostContext(self._session, url, data, headers,
+                                timeout, proxy or self._proxy, kw)
+
+
+class _CffiPostContext:
+    __slots__ = ("_session", "_url", "_data", "_headers", "_timeout",
+                 "_proxy", "_kw", "_resp")
+
+    def __init__(self, session, url, data, headers, timeout, proxy, kw):
+        self._session = session
+        self._url = url
+        self._data = data
+        self._headers = headers
+        self._timeout = timeout
+        self._proxy = proxy
+        self._kw = kw
+        self._resp = None
+
+    async def __aenter__(self):
+        t = self._timeout
+        if t is not None and hasattr(t, "total"):
+            t = t.total
+        hd = dict(self._headers) if self._headers else None
+        # 让 curl 自己计算 Content-Length，避免手工值与请求体不一致
+        if hd:
+            hd.pop("Content-Length", None)
+        resp = await self._session.post(
+            self._url, data=self._data, headers=hd,
+            timeout=t, proxy=self._proxy or None, **self._kw,
+        )
+        self._resp = CffiResponse(resp)
+        return self._resp
+
+    async def __aexit__(self, *exc):
+        return False
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # 🔥 浏览器指纹伪装池 — 模拟真实Chrome浏览器请求
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
@@ -54,6 +202,10 @@ _ACCEPT_LANG_POOL = [
 ]
 
 _SEC_CH_UA_POOL = [
+    '"Chromium";v="151", "Google Chrome";v="151", "Not?A_Brand";v="24"',
+    '"Chromium";v="150", "Google Chrome";v="150", "Not?A_Brand";v="24"',
+    '"Chromium";v="149", "Google Chrome";v="149", "Not?A_Brand";v="24"',
+    '"Chromium";v="148", "Google Chrome";v="148", "Not?A_Brand";v="24"',
     '"Chromium";v="131", "Google Chrome";v="131", "Not?A_Brand";v="99"',
     '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
     '"Chromium";v="129", "Google Chrome";v="129", "Not?A_Brand";v="99"',
@@ -65,8 +217,9 @@ def _random_browser_headers():
     """为每个IP/Token生成一组随机化的浏览器请求头，防指纹检测"""
     ua = random.choice(_UA_POOL)
     # 从UA中提取Chrome版本号用于Sec-Ch-Ua
-    cv = "131"
-    for v in ["136", "135", "134", "133", "132", "131", "130", "129", "128", "127", "126", "125", "124"]:
+    cv = "151"
+    for v in ["151", "150", "149", "148", "147", "146", "145", "144", "143", "142", "141",
+              "140", "139", "138", "137", "136", "135", "134", "133", "132", "131"]:
         if f"Chrome/{v}" in ua:
             cv = v
             break
@@ -75,15 +228,21 @@ def _random_browser_headers():
         "User-Agent": ua,
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": random.choice(_ACCEPT_LANG_POOL),
-        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Encoding": "gzip, deflate",
         "Origin": "https://beian.miit.gov.cn",
         "Referer": "https://beian.miit.gov.cn/",
-        "Sec-Ch-Ua": f'"Chromium";v="{cv}", "Google Chrome";v="{cv}", "Not?A_Brand";v="99"',
+        "Sec-Ch-Ua": f'"Chromium";v="{cv}", "Google Chrome";v="{cv}", "Not?A_Brand";v="24"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Ch-Ua-Platform-Version": '"19.0.0"',
+        "Sec-Ch-Ua-Arch": '"x86"',
+        "Sec-Ch-Ua-Bitness": '"64"',
+        "Sec-Ch-Ua-Full-Version-List": f'"Chromium";v="{cv}.0.0.0", "Google Chrome";v="{cv}.0.0.0"',
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
+        "X-Requested-With": "XMLHttpRequest",
+        "Priority": "u=1, i",
         "Cache-Control": "no-cache",
         "Cookie": f"__jsluid_s={uuid.uuid4().hex}",
     }
@@ -130,15 +289,22 @@ def get_local_ipv6_addresses():
                 return []
             for line in output.splitlines():
                 line_strip = line.strip()
+                # 只接受 DAD 状态为 Preferred/首选 的地址；Deprecated/Invalid/Tentative
+                # 无法绑定出口，会导致大量 "请求的地址无效" 浪费打码次数。
+                if not any(k in line_strip for k in ("Preferred", "首选")):
+                    continue
                 # 兼容中文 (公用/手动) 及可能的英文 (Public/Manual)
                 if any(k in line_strip for k in ("公用", "手动", "Public", "Manual")) and ":" in line_strip:
                     parts = line_strip.split()
-                    candidate = parts[-1]
-                    candidate = candidate.strip()
-                    # 去除可能的/前缀长度
-                    candidate = candidate.split("/")[0]
-                    if ":" in candidate and is_public_ipv6(candidate):
-                        addresses.append(candidate)
+                    for tok in parts:
+                        candidate = tok.strip().split("/")[0]
+                        try:
+                            ipaddress.IPv6Address(candidate)
+                        except Exception:
+                            continue
+                        if is_public_ipv6(candidate) and not candidate.startswith("2001:db8"):
+                            addresses.append(candidate)
+                            break
         else:  # Linux / mac
             output = _run_cmd_capture(["ip", "-6", "addr", "show"])
             if not output:
@@ -148,7 +314,8 @@ def get_local_ipv6_addresses():
                 if ("inet6" in line_strip) and ("scope global" in line_strip):
                     try:
                         candidate = line_strip.split()[1].split("/")[0]
-                        if is_public_ipv6(candidate):
+                        ipaddress.IPv6Address(candidate)
+                        if is_public_ipv6(candidate) and not candidate.startswith("2001:db8"):
                             addresses.append(candidate)
                     except Exception:
                         continue
@@ -162,7 +329,8 @@ class QueryContext:
     """隔离的查询上下文 - 每个IP+Token组合独立一份，支持并发安全"""
     __slots__ = ('ipv6', 'token', 'token_expire', 'token_ipv6',
                  'captcha_count', 'consecutive_fails', 'force_refresh',
-                 'max_captcha_per_token', 'token_lock', 'base_header')
+                 'max_captcha_per_token', 'token_lock', 'base_header',
+                 'queries', 'last_used', 'last_status')
     
     def __init__(self, ipv6, max_captcha_per_token=200):
         self.ipv6 = ipv6
@@ -175,11 +343,105 @@ class QueryContext:
         self.max_captcha_per_token = max_captcha_per_token
         self.token_lock = asyncio.Lock()
         self.base_header = None
+        self.queries = 0
+        self.last_used = 0.0
+        self.last_status = None
     
     def _get_base_header(self):
         if self.base_header is None:
             self.base_header = _random_browser_headers()
         return self.base_header.copy()
+
+
+class _QueryMetrics:
+    """轻量运行时指标：只统计本进程请求生命周期，不改变调度策略。"""
+    __slots__ = (
+        "started", "completed", "attempts", "retry",
+        "http_200", "http_403", "http_429", "http_5xx",
+        "network_error", "latency_total_ms", "latency_max_ms",
+        "latency_samples", "per_ip"
+    )
+
+    def __init__(self):
+        self.started = 0
+        self.completed = 0
+        self.attempts = 0
+        self.retry = 0
+        self.http_200 = 0
+        self.http_403 = 0
+        self.http_429 = 0
+        self.http_5xx = 0
+        self.network_error = 0
+        self.latency_total_ms = 0.0
+        self.latency_max_ms = 0.0
+        self.latency_samples = deque(maxlen=2048)
+        self.per_ip = {}
+
+    def record(self, ip, status, elapsed_ms, completed=False, retry=False):
+        self.attempts += 1
+        if retry:
+            self.retry += 1
+        self.latency_total_ms += elapsed_ms
+        self.latency_max_ms = max(self.latency_max_ms, elapsed_ms)
+        if elapsed_ms > 0:
+            self.latency_samples.append(elapsed_ms)
+        if completed:
+            self.completed += 1
+        if status == 200:
+            self.http_200 += 1
+        elif status == 403:
+            self.http_403 += 1
+        elif status == 429:
+            self.http_429 += 1
+        elif isinstance(status, int) and status >= 500:
+            self.http_5xx += 1
+        elif status == "network":
+            self.network_error += 1
+
+        if ip:
+            item = self.per_ip.setdefault(ip, {"n": 0, "ok": 0, "403": 0, "429": 0, "5xx": 0, "net": 0, "lat_ms": 0.0})
+            item["n"] += 1
+            item["lat_ms"] += elapsed_ms
+            if status == 200:
+                item["ok"] += 1
+            elif status == 403:
+                item["403"] += 1
+            elif status == 429:
+                item["429"] += 1
+            elif isinstance(status, int) and status >= 500:
+                item["5xx"] += 1
+            elif status == "network":
+                item["net"] += 1
+
+    @property
+    def avg_latency_ms(self):
+        return self.latency_total_ms / self.attempts if self.attempts else 0.0
+
+    @property
+    def p95_latency_ms(self):
+        if not self.latency_samples:
+            return 0.0
+        values = sorted(self.latency_samples)
+        return values[min(len(values) - 1, int(len(values) * 0.95))]
+
+
+class _GlobalPace:
+    """全局速率闸：令牌桶式最小间隔，限制全任务查询速率，
+    防止 24 worker 同时开火打满 WAF 窗口（第7条就403的根因）。"""
+
+    def __init__(self, rate):
+        self._interval = (1.0 / rate) if rate > 0 else 0.0
+        self._lock = asyncio.Lock()
+        self._next = 0.0
+
+    async def acquire(self):
+        if self._interval <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            if now < self._next:
+                await asyncio.sleep(self._next - now)
+            self._next = max(time.monotonic(), self._next) + self._interval
 
 
 class beian:
@@ -223,7 +485,7 @@ class beian:
         self.sign = "eyJ0eXBlIjozLCJleHREYXRhIjp7InZhZnljb2RlX2ltYWdlX2tleSI6IjUyZWI1ZTcyODViNzRmNWJhM2YwYzBkNTg0YTg3NmVmIn0sImUiOjE3NTY5NzAyNDg4MjN9.Ngpkwn4T7sQoQF9pCk_sQQpH61wQUEKnK2sQ8hDIq-Q"
         self.token = ""
         self.token_expire = 0
-        self.timeout = aiohttp.ClientTimeout(total=getattr(getattr(config, 'system', object()), 'http_client_timeout', 30))
+        self.timeout = aiohttp.ClientTimeout(total=getattr(getattr(config, 'system', object()), 'http_client_timeout', 30) or 30)
         self.local_ipv6_addresses = get_local_ipv6_addresses() if getattr(getattr(getattr(config, 'proxy', object()), 'local_ipv6_pool', object()), 'enable', False) else []
         self.ipv6_index = 0
         
@@ -244,9 +506,26 @@ class beian:
             'enable_cleanup_closed': True
         }
 
-        self._blocked_ip_cache = TTLCache(maxsize=1000, ttl=120)  # 120秒TTL，支持更长冷却
+        self._blocked_ip_cache = TTLCache(maxsize=1000, ttl=2000)  # TTL>1800s封禁，避免120s提前解封
         # Bug 1 & 5 修复：使用 asyncio.Lock 替代 threading.Lock
         self._blocked_ip_lock = asyncio.Lock()
+        # 封禁缓存持久化：服务重启后继续冷却被封IP，避免把刚被封的IP再试一遍
+        self._blocked_cache_file = os.path.join(get_project_root(), "logs", "blocked_ips.json")
+        self._last_blocked_save = 0.0
+        try:
+            if os.path.exists(self._blocked_cache_file):
+                with open(self._blocked_cache_file, "r", encoding="utf-8") as _f:
+                    _data = ujson.load(_f)
+                _now = time.time()
+                _loaded = 0
+                for _ip, _ts in _data.items():
+                    if isinstance(_ts, (int, float)) and _ts > _now:
+                        self._blocked_ip_cache[_ip] = float(_ts)
+                        _loaded += 1
+                if _loaded:
+                    logger.info(f"💾 已加载 {_loaded} 个封禁IP（重启后继续冷却）")
+        except Exception as e:
+            logger.warning(f"加载封禁IP缓存失败: {e}")
 
         # 用于跟踪当前正在使用的 IPv6 地址（用于被拦截时的索引计算）
         self._last_used_ipv6_index = -1
@@ -263,12 +542,12 @@ class beian:
         self._token_consecutive_fails = 0  # 连续打码失败次数
         self._max_captcha_per_token = getattr(
             getattr(config, 'captcha', object()), 'max_per_token', 60
-        )  # 每Token最大打码次数，默认60
+        ) or 60  # 每Token最大打码次数，默认60
         self._token_force_refresh = False  # 强制刷新标记
         # 每IP查询配额（批量模式按配额轮换IP，避免单IP被限流/封禁）
         self._queries_per_ip = getattr(
             getattr(config, 'captcha', object()), 'queries_per_ip', 20
-        )
+        ) or 20
         self._ip_queries_used = 0  # 当前粘性IP已查询次数
         # 每IP稳定浏览器身份档案：一个IP一个身份（UA/Sec-Ch-Ua/语言/cookie），防跨IP共享指纹
         self._ip_fingerprints = {}
@@ -282,8 +561,76 @@ class beian:
         # === Token 获取专用锁（防止并发重复auth） ===
         self._token_fetch_lock = asyncio.Lock()
         self._token_ipv6 = None  # 记录Token绑定的IPv6（MIIT可能校验来源IP一致性）
+
+        # === 全局取号节流（关键）===
+        # 实测：auth 突发（≥4路并发连续打）会让创宇盾对 auth 接口限流，
+        # 表现为大量"当前访问已被创宇盾拦截"（token失败率可高达40%）。
+        # 全局串行 + 最小间隔250ms ≈ 4次/s，足够24 worker每token≈30条的需求。
+        self._auth_gate = asyncio.Lock()
+        self._last_auth_ts = 0.0
+        self._auth_min_interval = 0.25
+        self._auth_semaphore = asyncio.Semaphore(2)  # 有界并发，避免 auth 突发再被 WAF 惩罚
+        self._auth_waf_fail_streak = 0  # 全局 auth WAF 连续失败计数
+        self._auth_global_cooldown_until = 0.0  # 全局 auth 风控冷却截止时间
         
         self._batch_mode = False
+
+        # === 可选查询引擎与隧道代理 ===
+        # query_http_client: aiohttp | curl_cffi（Chrome TLS指纹，实测后切换）
+        self._http_client = str(getattr(
+            getattr(config, 'system', object()), 'query_http_client', 'aiohttp'
+        ) or 'aiohttp').strip().lower()
+        _tunnel = getattr(config, 'proxy', object()).tunnel or object()
+        self._tunnel_url = str(getattr(_tunnel, 'url', '') or '').strip()
+        self._tunnel_enable = bool(getattr(_tunnel, 'enable', False))
+        try:
+            self._tunnel_batch_slots = max(
+                1, int(getattr(_tunnel, 'batch_slots', 0) or 0))
+        except (TypeError, ValueError):
+            self._tunnel_batch_slots = 0
+        if self._http_client == "curl_cffi" and not _CURL_CFFI_OK:
+            logger.warning("⚠️ 配置使用 curl_cffi，但未安装，回退 aiohttp")
+            self._http_client = "aiohttp"
+
+        # === 共享token批量模式（1次取号+1次打码 服务整个任务）===
+        # 实测：单IP窗口被创宇盾frequency_high限死在~55-65条，但token/uuid/sign
+        # 不绑定IP（跨IP实测0次token失效）。共享模式 = 全任务只取号打码一次，
+        # 同一token轮流用多个IP，每个IP查 shared_queries_per_ip 条后轮换。
+        self._shared_token_mode = bool(getattr(
+            getattr(config, 'system', object()), 'shared_token_batch', False))
+        try:
+            self._shared_queries_per_ip = max(
+                5, int(getattr(getattr(config, 'system', object()),
+                               'shared_queries_per_ip', 30) or 30))
+        except (TypeError, ValueError):
+            self._shared_queries_per_ip = 30
+        self._shared_token_cap = max(
+            20, int(getattr(getattr(config, 'system', object()),
+                            'token_query_cap', 200) or 200))
+        self._shared_cred = None      # (uuid, token, sign, base_header, expire_at_ms)
+        self._shared_cred_lock = asyncio.Lock()
+        self._shared_used = 0
+        self._shared_consumed = set()  # 已消费额度的域名idx（重试不重复计数）
+        self._shared_reauth_lock = asyncio.Lock()
+        self._shared_active = False
+
+    async def _shared_try_consume(self, idx=None):
+        """共享token模式：每个域名消费一次额度（重试不重复计数），满cap后拒绝。"""
+        async with self._shared_cred_lock:
+            if idx is not None and idx in self._shared_consumed:
+                return True
+            if self._shared_used >= self._shared_token_cap:
+                return False
+            self._shared_used += 1
+            if idx is not None:
+                self._shared_consumed.add(idx)
+            return True
+
+    def _shared_invalidate(self):
+        """token失效时清除共享凭证，下次check_img会真实重新取号（罕见兜底）。"""
+        self._shared_cred = None
+        self._shared_consumed = set()
+        self._shared_active = False
 
     # === 验证码预取池：后台持续打码 ===
     async def _captcha_filler(self):
@@ -386,9 +733,71 @@ class beian:
         if not ip:
             return
         async with self._blocked_ip_lock:
-            expire_at = time.time() + cooldown
+            now = time.time()
+            old_expire = self._blocked_ip_cache.get(ip, 0)
+            if old_expire > now + cooldown:
+                # 已有更长冷却（如 WAF 拦截 300s/替换 1800s），不降级
+                return
+            expire_at = now + cooldown
             self._blocked_ip_cache[ip] = expire_at
             logger.info(f"🛡️ IP {ip[-12:]} 被创宇盾拦截，{cooldown}s后恢复")
+        self._maybe_save_blocked_cache()
+        # 30分钟级(1800s)封禁说明该IP已被WAF拉黑：直接换成新IP，避免固定池子
+        # 被耗尽后所有worker只能干等（表现为任务“卡住不动”）。
+        # auth 的“创宇盾拦截”是瞬时风控（5s冷却），不做IP替换。
+        if cooldown >= 1800:
+            try:
+                await self._replace_blocked_ip(ip)
+            except Exception as e:
+                logger.warning(f"替换被封IP失败: {ip[-12:]} - {e}")
+
+    def _maybe_save_blocked_cache(self):
+        """节流保存封禁IP缓存（每3秒最多写一次），重启后能记住冷却状态。"""
+        cache_file = getattr(self, "_blocked_cache_file", None)
+        if not cache_file:
+            return
+        now = time.time()
+        last_save = getattr(self, "_last_blocked_save", 0.0)
+        if now - last_save < 3:
+            return
+        self._last_blocked_save = now
+        try:
+            data = {ip: ts for ip, ts in self._blocked_ip_cache.items() if ts > now}
+            tmp = cache_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                ujson.dump(data, f)
+            os.replace(tmp, cache_file)
+        except Exception as e:
+            logger.debug(f"保存封禁IP缓存失败: {e}")
+
+    async def _replace_blocked_ip(self, ip):
+        """关闭被封IP的会话/指纹缓存，并从IPv6池中换一个新地址。"""
+        if not ip:
+            return
+        if isinstance(ip, str) and ip.startswith("tunnel-"):
+            # 隧道槽位没有系统IPv6地址，不参与池替换
+            return
+        self._init_session_pool()
+        session = None
+        async with self._session_pool_lock:
+            session = self._session_pool.pop(ip, None)
+        if session is not None and not session.closed:
+            # 延迟关闭：并发模式下可能仍有在飞请求使用该session，
+            # 等2秒后再关闭，避免 Connector is closed / 取消在飞请求
+            async def _close_later():
+                await asyncio.sleep(2)
+                try:
+                    if not session.closed:
+                        await session.close()
+                except Exception:
+                    pass
+            task = asyncio.create_task(_close_later())
+            self._session_close_tasks.add(task)
+            task.add_done_callback(self._session_close_tasks.discard)
+        self._ip_fingerprints.pop(ip, None)
+        pool = getattr(self, '_ipv6_pool', None)
+        if pool is not None:
+            await pool.replace_blocked_address(ip)
 
     async def _handle_throttle(self, ipv6, cooldown=120):
         """上游限流/拦截时：冷却当前IP并轮换粘性IP，避免单IP持续被打"""
@@ -425,6 +834,31 @@ class beian:
             value = rest.split(";")[0].strip()
             jar[name] = value
         prof["headers"]["Cookie"] = "; ".join(f"{k}={v}" for k, v in jar.items())
+
+    def merge_cookies_into(self, headers, set_cookie_values):
+        """把 Set-Cookie 合并进指定 headers 的 Cookie 字段。
+
+        auth -> 验证码图片 -> 提交验证码 -> 查询 必须携带同一套 WAF Cookie。
+        当前文件此前缺失此方法，调用时被 except Exception: pass 吞掉，
+        导致 auth/check_img 阶段下发的 Cookie 从未回传，最终被创宇盾拦截。
+        """
+        if not headers:
+            return
+        jar = {}
+        for part in str(headers.get("Cookie", "")).split(";"):
+            part = part.strip()
+            if "=" in part:
+                n, _, v = part.partition("=")
+                jar[n.strip()] = v.strip()
+        for raw in set_cookie_values:
+            if not raw:
+                continue
+            n, _, rest = raw.partition("=")
+            n = n.strip()
+            if n:
+                jar[n] = rest.split(";")[0].strip()
+        if jar:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in jar.items())
 
     async def _is_ip_blocked(self, ip):
         """异步检查 IP 是否在黑名单缓存中（自动清理过期条目）"""
@@ -494,7 +928,7 @@ class beian:
                 attempts += 1
 
                 # Bug 9 修复：在锁内检查黑名单，确保原子性
-                if not (current_ipv6 in self._blocked_ip_cache):
+                if not await self._is_ip_blocked(current_ipv6):
                     self._last_used_ipv6_index = (self.ipv6_index - 1) % len(self.local_ipv6_addresses)
                     return current_ipv6
                 else:
@@ -555,36 +989,68 @@ class beian:
     # 原来每次请求都创建新 session + connector（4次/查询），极度浪费
     # 现在按 IPv6 地址缓存 session，复用连接
     def _init_session_pool(self):
-        """初始化 session 池"""
+        """初始化 session 池。
+
+        key 同时包含 proxy + IPv6，避免不同出口共享同一个 session。
+        同一 key 始终复用同一个 session/connector，保证连接池真正生效。
+        """
         if not hasattr(self, '_session_pool'):
-            self._session_pool = {}  # IPv6地址 -> session
+            self._session_pool = {}  # (proxy, IPv6) -> session
             self._session_pool_lock = asyncio.Lock()
+            self._session_close_tasks = set()  # 延迟关闭任务引用，防止被GC
+            self._session_pool_hits = 0
+            self._session_pool_misses = 0
 
     async def _get_session_from_pool(self, proxy="", ipv6=None):
-        """从池中获取或创建 session（复用连接，大幅提速）
-        ipv6: 指定IPv6地址（同查询复用时传入）"""
+        """从池中获取或创建 session；整个进程生命周期内按出口复用。"""
         self._init_session_pool()
-        
-        local_ipv6 = ipv6  # 优先使用传入的指定IPv6
+
+        local_ipv6 = ipv6
         if not local_ipv6 and not proxy and self.local_ipv6_addresses:
             local_ipv6 = await self._get_next_ipv6()
-        
-        key = local_ipv6 or "__default__"
-        
+
+        key = (proxy or "", local_ipv6 or "__default__")
+
         async with self._session_pool_lock:
-            if key not in self._session_pool or self._session_pool[key].closed:
+            session = self._session_pool.get(key)
+            if session is not None and not session.closed:
+                self._session_pool_hits += 1
+                return session
+
+            self._session_pool_misses += 1
+            if self._http_client == "curl_cffi" and _CURL_CFFI_OK:
+                session = CffiSession(self, proxy=proxy, ipv6=local_ipv6)
+            else:
                 connector = await self._get_connector(local_ipv6)
-                self._session_pool[key] = aiohttp.ClientSession(
+                session = aiohttp.ClientSession(
                     timeout=self.timeout,
                     connector=connector,
-                    headers={'Connection': 'keep-alive'}
+                    headers={'Connection': 'keep-alive'},
                 )
-            return self._session_pool[key]
+            self._session_pool[key] = session
+            return session
+
+    def _get_session_local_ip(self, session):
+        """返回 aiohttp connector 实际配置的 local_addr；curl_cffi 返回绑定接口。"""
+        try:
+            if hasattr(session, '_connector') and hasattr(session._connector, '_local_addr'):
+                addr = session._connector._local_addr
+                if addr:
+                    return addr[0]
+        except Exception:
+            pass
+        return None
 
     @asynccontextmanager
     async def get_session(self, proxy="", ipv6=None):
         """保持向后兼容：优先使用池，也支持独立 session
         ipv6: 指定IPv6（同查询复用时传入），None则自动轮询"""
+        # 混合出口模式：tunnel-* 虚拟槽位走代理出口；
+        # 未指定ipv6（单查模式）且启用隧道时也走代理；真实IPv6保持直连。
+        if (not proxy and self._tunnel_enable and self._tunnel_url
+                and (ipv6 is None or (isinstance(ipv6, str) and ipv6.startswith("tunnel-")))):
+            proxy = self._tunnel_url
+            ipv6 = None
         session = await self._get_session_from_pool(proxy, ipv6=ipv6)
         local_ipv6 = ipv6
         if not local_ipv6 and not proxy and self.local_ipv6_addresses:
@@ -661,52 +1127,79 @@ class beian:
             auth_data = {"authKey": authKey, "timeStamp": timeStamp}
 
             try:
-                async with self.get_session(proxy, ipv6=ipv6) as session:
-                    current_ip = None
-                    if hasattr(session, '_connector') and hasattr(session._connector, '_local_addr'):
-                        current_ip = session._connector._local_addr[0] if session._connector._local_addr else None
-                    await self._rate_limit_wait()
-                    async with session.post(
-                        self.url, data=auth_data, headers=base_header,
-                        proxy=proxy if proxy else None,
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as req:
-                        req_text = await req.text()
+                async with self._auth_semaphore:
+                    now = time.monotonic()
+                    wait = self._last_auth_ts - now
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    self._last_auth_ts = time.monotonic() + self._auth_min_interval
+                    async with self.get_session(proxy, ipv6=ipv6) as session:
+                        current_ip = None
+                        if hasattr(session, '_connector') and hasattr(session._connector, '_local_addr'):
+                            current_ip = session._connector._local_addr[0] if session._connector._local_addr else None
+                        # 全局 auth 使用有界并发 + 最小间隔，避免 32 个 worker 同时打 auth。
+                        async with session.post(
+                            self.url, data=auth_data, headers=base_header,
+                            proxy=proxy if proxy else None,
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as req:
+                            req_text = await req.text()
+                            try:
+                                set_cookies = req.headers.getall("Set-Cookie", [])
+                                if set_cookies:
+                                    self.merge_cookies_into(base_header, set_cookies)
+                            except Exception:
+                                pass
 
-                        if "当前访问疑似黑客攻击" in req_text:
-                            if current_ip:
-                                await self._add_blocked_ip(current_ip)
-                            elif ipv6:
-                                await self._add_blocked_ip(ipv6)
-                            elif not proxy and self.local_ipv6_addresses:
-                                if self._last_used_ipv6_index >= 0:
-                                    blocked_ip = self.local_ipv6_addresses[self._last_used_ipv6_index]
-                                    await self._add_blocked_ip(blocked_ip)
-                            return False, "当前访问已被创宇盾拦截", ""
+                            if "当前访问疑似黑客攻击" in req_text:
+                                blocked = current_ip or ipv6
+                                if not blocked and not proxy and self.local_ipv6_addresses:
+                                    if self._last_used_ipv6_index >= 0:
+                                        blocked = self.local_ipv6_addresses[self._last_used_ipv6_index]
+                                # auth 风控：短冷却 + 全局退避，不再继续并发打 auth。
+                                self._auth_waf_fail_streak += 1
+                                if self._auth_waf_fail_streak >= 8:
+                                    self._auth_waf_fail_streak = 0
+                                    self._auth_global_cooldown_until = time.monotonic() + 15
+                                    logger.warning(
+                                        "🛑 auth 连续被创宇盾拦截，全局暂停 15s 冷却"
+                                    )
+                                await self._add_blocked_ip(blocked, cooldown=5)
+                                self._last_auth_ts = time.monotonic() + 1.2
+                                return False, "当前访问已被创宇盾拦截", ""
 
-                        t = ujson.loads(req_text)
-                        token = t["params"]["bussiness"]
-                        expire = int(time.time() * 1000) + t["params"]["expire"]
+                            t = ujson.loads(req_text)
+                            token = t["params"]["bussiness"]
+                            expire = int(time.time() * 1000) + t["params"]["expire"]
 
-                        if ctx:
-                            ctx.token = token
-                            ctx.token_expire = expire
-                            ctx.token_ipv6 = ipv6
-                            ctx.captcha_count = 0
-                            ctx.consecutive_fails = 0
-                            ctx.force_refresh = False
-                        else:
-                            self.token = token
-                            self.token_expire = expire
-                            self._token_ipv6 = ipv6
-                            self._token_captcha_count = 0
-                            self._token_consecutive_fails = 0
-                            self._token_force_refresh = False
-                        logger.info(f"🔑 新 Token 已获取 (IP={ipv6})，过期倒计时: {expire/1000:.0f}s")
-                        return True, token, base_header
+                            if ctx:
+                                ctx.token = token
+                                ctx.token_expire = expire
+                                ctx.token_ipv6 = ipv6
+                                ctx.captcha_count = 0
+                                ctx.consecutive_fails = 0
+                                ctx.force_refresh = False
+                            else:
+                                self.token = token
+                                self.token_expire = expire
+                                self._token_ipv6 = ipv6
+                                self._token_captcha_count = 0
+                                self._token_consecutive_fails = 0
+                                self._token_force_refresh = False
+                            logger.info(f"🔑 新 Token 已获取 (IP={ipv6})，过期倒计时: {expire/1000:.0f}s")
+                            self._auth_waf_fail_streak = 0
+                            return True, token, base_header
             except BaseException as e:
-                logger.warning(f"get_token Faile : {e}")
-                return False, str(e), ""
+                msg = str(e)
+                low = msg.lower()
+                if ipv6 and any(k in low for k in (
+                        "请求的地址无效", "invalid argument",
+                        "cannot assign requested address", "cannot bind",
+                        "invalid address", "address is not valid")):
+                    # 地址在系统里已失效/被删除，直接长冷却并触发替换，避免反复白打码
+                    await self._add_blocked_ip(ipv6, cooldown=1800)
+                logger.warning(f"get_token Faile : {msg}")
+                return False, msg, ""
 
     async def get_cookie(self, proxy=""):
         async with await self.get_session(proxy) as session:
@@ -795,9 +1288,49 @@ class beian:
         logger.info(f"缺口定位：x={offset_x}, 滑块={sw}x{sh}")
         return True, offset_x
 
-    async def check_img(self, proxy="", ipv6=None, ctx=None):
+    async def check_img(self, proxy="", ipv6=None, ctx=None, _skip_shared=False):
         # ctx: QueryContext实例，支持并发隔离
         _t0 = time.time()
+
+        # === 共享token模式：已有共享凭证时，不再取号打码，直接复用 ===
+        if self._shared_token_mode and not _skip_shared:
+            _now_ms = int(time.time() * 1000)
+            if self._shared_active and self._shared_cred is not None:
+                pu, tk, sn, hd0, _exp = self._shared_cred
+                if _exp > _now_ms:
+                    if ctx:
+                        ctx.token = tk
+                        ctx.token_expire = _exp
+                        ctx.token_ipv6 = ipv6
+                        ctx.captcha_count = 0
+                        ctx.consecutive_fails = 0
+                    hd = dict(hd0)
+                    hd["Content-Type"] = "application/json"
+                    return True, pu, tk, sn, hd
+                # 真实过期：落到下面重取分支
+            # 凭证失效/过期后需要重取：串行化，避免多个worker同时打码
+            async with self._shared_reauth_lock:
+                if self._shared_active and self._shared_cred is not None:
+                    pu, tk, sn, hd0, _exp = self._shared_cred
+                    if _exp > _now_ms:
+                        if ctx:
+                            ctx.token = tk
+                            ctx.token_expire = _exp
+                            ctx.token_ipv6 = ipv6
+                            ctx.captcha_count = 0
+                        hd = dict(hd0)
+                        hd["Content-Type"] = "application/json"
+                        return True, pu, tk, sn, hd
+                    # 拿到锁且确认已过期：清除凭证，走真实取号（single-flight）
+                    logger.info("⏰ 共享凭证真实过期，重新取号打码")
+                    self._shared_active = False
+                    self._shared_cred = None
+                # 拿到锁且仍无凭证：由当前协程 single-flight 真实取号，
+                # 其他 worker 在这里等锁，成功后直接复用，避免 32 路同时 auth。
+                logger.info("🔁 共享token重新取号：单协程打码，其余worker等待复用")
+                return await self.check_img(
+                    proxy=proxy, ipv6=ipv6, ctx=ctx, _skip_shared=True,
+                )
         
         # === 验证码预取池：非阻塞尝试，池空则走正常流程 ===
         self._ensure_filler_running()
@@ -841,7 +1374,14 @@ class beian:
             try:
                 async with self.get_session(proxy, ipv6=ipv6) as session:
                     async with session.post(self.getCheckImage, data=data, headers=base_header, proxy=proxy if proxy else None) as req:
-                        res = await req.json()
+                        try:
+                            set_cookies = req.headers.getall("Set-Cookie", [])
+                            if set_cookies:
+                                self.merge_cookies_into(base_header, set_cookies)
+                        except Exception:
+                            pass
+                        res_text = await req.text()
+                        res = ujson.loads(res_text)
             except BaseException as e:
                 logger.info(f"请求验证码时失败：{e}")
                 # 403 / 非JSON响应 = Token可能已失效，触发强制轮换
@@ -879,6 +1419,12 @@ class beian:
             try:
                 async with self.get_session(proxy, ipv6=ipv6) as session:
                     async with session.post(self.checkImage, data=check_data, headers=base_header, proxy=proxy if proxy else None) as req:
+                        try:
+                            set_cookies = req.headers.getall("Set-Cookie", [])
+                            if set_cookies:
+                                self.merge_cookies_into(base_header, set_cookies)
+                        except Exception:
+                            pass
                         check_res = await req.text()
             except BaseException as e:
                 logger.warning(f"提交验证码时失败：{e}")
@@ -946,6 +1492,11 @@ class beian:
                 
                 _t_total = (time.time() - _t0) * 1000
                 logger.info(f"⏱️ check_img成功: auth={(_t_token-_t0)*1000:.0f}ms img={(_t_getimg-_t_token)*1000:.0f}ms match={(_t_match-_t_getimg)*1000:.0f}ms submit={(_t_check-_t_match)*1000:.0f}ms total={_t_total:.0f}ms")
+                # 共享token模式：真实取号成功后立即共享给所有worker（含失效后重取）
+                if self._shared_token_mode:
+                    _exp_ms = ctx.token_expire if ctx else self.token_expire
+                    self._shared_cred = (p_uuid, token, sign, dict(base_header), _exp_ms)
+                    self._shared_active = True
                 return True, p_uuid, token, sign, base_header
 
         except BaseException as e:
@@ -1133,7 +1684,7 @@ class beian:
 
             # Bug 4 修复：优化并发控制，使用更合理的批处理策略
             max_concurrency = min(
-                getattr(getattr(config, "system", object()), "detail_concurrency", 5),
+                getattr(getattr(config, "system", object()), "detail_concurrency", 5) or 5,
                 len(items),
                 20  # 最大并发限制
             )
@@ -1500,9 +2051,25 @@ class beian:
         import random, time as _time, traceback
         
         total = len(domains)
-        total_ips = len(self.local_ipv6_addresses)
+        # 混合出口模式：本地IPv6池 + Clash/机场隧道虚拟槽位同时工作。
+        tunnel_mode = bool(
+            getattr(self, "_tunnel_enable", False)
+            and getattr(self, "_tunnel_url", None)
+            and getattr(self, "_tunnel_batch_slots", 0) > 0
+        )
+        if tunnel_mode:
+            # 隧道槽位放在最前：workers 按分片轮转时 Clash 一定先被用到，
+            # 之后循环回本地 IPv6，两条出口在同一个任务里都真实出量。
+            exit_slots = ([f"tunnel-{i}" for i in range(self._tunnel_batch_slots)]
+                          + list(self.local_ipv6_addresses))
+            logger.info(f"🌉 混合出口: {len(self.local_ipv6_addresses)} 本地IPv6 "
+                        f"+ {self._tunnel_batch_slots} Clash隧道槽位 "
+                        f"(代理 {self._tunnel_url})")
+        else:
+            exit_slots = list(self.local_ipv6_addresses)
+        total_ips = len(exit_slots)
         if total_ips == 0:
-            return [(d, False, "无可用IPv6") for d in domains]
+            return [(d, False, "无可用出口") for d in domains]
         
         # 🔥 回退并发模型 (2026-08-01 v3):
         #   实测: 串行=极慢+创宇盾照样封 → 封IP与并发无关, 是阈值触发
@@ -1512,7 +2079,10 @@ class beian:
             int(getattr(getattr(config, 'system', object()), 'batch_workers', 8) or 8),
             32,
         )
-        OPTIMAL_CAPTCHA_CONC = 8
+        # auth/取号并发降低到4：WAF对auth并发最敏感，4路流水线足够24个worker
+        # 以每token≈30条的速度补货（约1token/s）
+        OPTIMAL_CAPTCHA_CONC = max(2, min(4, int(getattr(
+            getattr(config, 'system', object()), 'captcha_concurrency', 4) or 4)))
         IP_QUERY_CONCURRENCY = max(1, int(getattr(
             getattr(config, 'system', object()), 'ip_query_concurrency', 3) or 3))
         IP_QUERY_LAUNCH_INTERVAL = max(0.0, float(getattr(
@@ -1521,8 +2091,20 @@ class beian:
             getattr(config, 'system', object()), 'token_query_cap', 300) or 300))
         IP_QUERIES_PER_ROTATION = max(1, int(getattr(
             getattr(config, 'system', object()), 'ip_queries_per_rotation', 8) or 8))
-        MAX_REQUEUE_ATTEMPTS = max(1, int(getattr(
-            getattr(config, 'system', object()), 'max_requeue_attempts', 30) or 30))
+        # 自适应配额：硬429（30分钟拉黑）频发说明当前WAF阈值低于配置值，
+        # 自动降配避免IP还没轮换就被拉黑；上游正常时保持配置值。
+        rotation_cap = IP_QUERIES_PER_ROTATION
+        # 共享token模式：每IP查询数取共享配置（实测低于WAF硬化阈值~55，留余量）
+        shared_mode = bool(getattr(self, "_shared_token_mode", False))
+        if shared_mode:
+            rotation_cap = min(rotation_cap, self._shared_queries_per_ip)
+        _configured_requeue = max(1, int(getattr(
+            getattr(config, 'system', object()), 'max_requeue_attempts', 5) or 5))
+        MAX_REQUEUE_ATTEMPTS = min(_configured_requeue, 8)
+        # 全局速率闸：限制全任务查询速率（条/秒），0=不限
+        GLOBAL_QUERY_RATE = max(0.0, float(getattr(
+            getattr(config, 'system', object()), 'global_query_rate', 0) or 0))
+        pace = _GlobalPace(GLOBAL_QUERY_RATE)
         
         max_workers = min(max_workers if (max_workers is not None and max_workers > 0) else OPTIMAL_WORKERS, 
                          total_ips, total, OPTIMAL_WORKERS)
@@ -1535,10 +2117,51 @@ class beian:
         
         # 结果 + 统计
         results = [None] * total
-        stats = {'ok': 0, 'fail': 0, 'reg': 0, 'retry': 0, 'captcha': 0, 'net_err': 0}
+        stats = {'ok': 0, 'fail': 0, 'reg': 0, 'retry': 0, 'captcha': 0, 'net_err': 0,
+                 'http_attempts': 0, 'http_200': 0, 'http_403': 0, 'http_429': 0,
+                 'http_5xx': 0, 'latency_ms': 0.0, 'latency_max_ms': 0.0}
+        metrics = _QueryMetrics()
         stats_lock = asyncio.Lock()
         # 跨worker共享的连续失败计数：避免尾部多worker各自重试、反复空转
         shared_blocked_waits = 0
+        # 跨worker的IP独占认领：动态补充的新IP不允许被多个worker同时使用，
+        # 避免同IP并发打auth被创宇盾拦截（池子越小越关键）
+        claimed_ips = set()
+        claimed_lock = asyncio.Lock()
+        # 每IP token缓存：403换IP时token不丢，IP冷却后回来直接复用，省一次取号+打码。
+        # 只在 403/短冷却 轮换时缓存；硬429/token失效/轮换额度用完 必须丢弃。
+        ip_token_cache = {}
+
+        async def claim_ip(ip):
+            async with claimed_lock:
+                if ip in claimed_ips:
+                    return False
+                claimed_ips.add(ip)
+                return True
+
+        async def release_ip(ip):
+            if ip:
+                async with claimed_lock:
+                    claimed_ips.discard(ip)
+
+        async def cache_token(ip, ctx, cred, hd, used):
+            """把仍有效的token按IP缓存，供冷却结束后复用。"""
+            if not ip or ctx is None or cred is None or hd is None:
+                return
+            if used >= TOKEN_QUERY_CAP:
+                return
+            if ctx.token_expire <= int(_time.time() * 1000):
+                return
+            if len(ip_token_cache) >= len(exit_slots) + 16:
+                return
+            ip_token_cache[ip] = (ctx, cred, hd, used)
+
+        def drop_token(ip):
+            ip_token_cache.pop(ip, None)
+
+        async def is_ip_claimed(ip):
+            async with claimed_lock:
+                return ip in claimed_ips
         # 自适应调速：按近期成功率自动降速/提速，保护子网信誉
         pace_ok = 0
         pace_attempts = 0
@@ -1552,10 +2175,12 @@ class beian:
 
         async def schedule_retry(idx, domain, rc, kind="net"):
             """按失败类型延迟重试：
-            403=瞬时挑战3s后重试; 429=长退避等IP冷却; 其他=指数退避"""
+            403=瞬时挑战1s后重试(IP已短冷却); 429=长退避等IP冷却; 其他=指数退避"""
             nonlocal retry_seq
             if kind == "403":
-                delay = 3.0
+                # 1 秒重试太激进，会把同一个被限流的 IP 反复打爆。
+                # 旧版高吞吐使用的是 3 秒起步，并随重试次数逐步退避。
+                delay = min(3.0 + max(0, rc - 1) * 1.0, 15.0)
             elif kind == "429":
                 delay = min(30 * (2 ** min(rc - 1, 4)), 600)  # 30s,60s,120s,240s,480s...
             else:
@@ -1563,12 +2188,210 @@ class beian:
             retry_seq += 1
             await retry_heap.put((_time.monotonic() + delay, retry_seq, idx, domain))
         
-        # 挑选可用IP（排除已知被封的）
-        available_ips = [ip for ip in self.local_ipv6_addresses 
-                        if ip not in self._blocked_ip_cache]
+        # 挑选可用IP（排除已知被封的，用带过期判断的 _is_ip_blocked）
+        available_ips = []
+        for _ip in exit_slots:
+            if not await self._is_ip_blocked(_ip):
+                available_ips.append(_ip)
         if not available_ips:
-            available_ips = list(self.local_ipv6_addresses)
+            available_ips = list(exit_slots)
         random.shuffle(available_ips)
+
+        # === 共享token模式：全任务只取号打码一次，之后所有IP复用同一token ===
+        if shared_mode:
+            for s_ip in available_ips[:10]:
+                if await self._is_ip_blocked(s_ip):
+                    continue
+                s_ctx = QueryContext(s_ip, max_captcha_per_token=self._shared_token_cap)
+                try:
+                    async with captcha_sem:
+                        ok, pu, tk, sn, hd0 = await self.check_img(ipv6=s_ip, ctx=s_ctx)
+                except Exception as e:
+                    ok = False
+                    pu = f"{type(e).__name__}: {e}"[:80]
+                if ok:
+                    hd0["Content-Type"] = "application/json"
+                    self._shared_cred = (pu, tk, sn, dict(hd0), s_ctx.token_expire)
+                    self._shared_active = True
+                    self._shared_used = 0
+                    stats['tokens'] += 1
+                    logger.info(f"🔗 共享token模式: 1次取号打码(IP={s_ip[-12:]}) "
+                                f"最多服务{self._shared_token_cap}条，每IP≤{rotation_cap}条")
+                    break
+                logger.warning(f"⏳ 共享token首轮取号失败({str(pu)[:60]})，换IP")
+            if not self._shared_active:
+                logger.error("💥 共享token取号全部失败，任务将按需各自取号（回退）")
+
+        # === 预热：预取token（取号+打码）+ 1条预热查询，正式任务免现场排队 ===
+        prefetch_count = int(getattr(getattr(config, 'system', object()), 'token_prefetch_count', 0) or 0)
+        warm_query_enabled = bool(getattr(getattr(config, 'system', object()), 'warm_query_enable', False))
+        if shared_mode:
+            prefetch_count = 0
+        if prefetch_count <= 0 and not shared_mode:
+            # 默认只预取到 active worker 水位，避免启动阶段成倍消耗真实查询。
+            prefetch_count = min(max(max_workers, 4), len(available_ips))
+        else:
+            prefetch_count = min(prefetch_count, len(available_ips))
+        prefetch_count = min(prefetch_count, total)
+        # 只预热“任务实际会用到的 token 数”：1000条/每token查100条时预热10个就够，
+        # 多拉的token全是白打码（打码是成本+瓶颈）。
+        _needed_tokens = (total + IP_QUERIES_PER_ROTATION - 1) // IP_QUERIES_PER_ROTATION
+        prefetch_count = min(prefetch_count, max(1, _needed_tokens + 2))
+        prefetch_q = asyncio.Queue()
+        prefetching_ips = set()
+        prefetching_lock = asyncio.Lock()
+        prefetch_stop = asyncio.Event()
+        prefetch_refill_tasks = set()
+
+        def _tunnel_first(items):
+            """排序：隧道槽位排最前，保证Clash出口每任务都被预热使用。"""
+            return sorted(items, key=lambda ip: 0 if str(ip).startswith("tunnel-") else 1)
+
+        async def warm_query(p_ip, cred, hd):
+            """预热查询：验证token可用并吸收首次403，成功才入池。"""
+            info = ujson.loads(self.typj.get(sp))
+            info["pageNum"] = 1
+            info["pageSize"] = pageSize
+            info["unitName"] = f"warm{random.randint(0, 999999)}.top"
+            body = ujson.dumps(info, ensure_ascii=False)
+            for attempt in range(2):
+                h = dict(hd)
+                h.update({
+                    "Content-Length": str(len(body.encode("utf-8"))),
+                    "uuid": cred["uuid"], "token": cred["token"], "sign": cred["sign"],
+                })
+                try:
+                    await pace.acquire()
+                    async with self.get_session(ipv6=p_ip) as session:
+                        async with session.post(
+                            self.queryByCondition, data=body, headers=h,
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        ) as req:
+                            try:
+                                sc = req.headers.getall("Set-Cookie", [])
+                                if sc:
+                                    self.update_fingerprint_cookies(p_ip, sc)
+                            except Exception:
+                                pass
+                            if req.status == 200:
+                                try:
+                                    data = ujson.loads(await req.text())
+                                    return bool(data.get("success", False) or data.get("code") == 200)
+                                except Exception:
+                                    return False
+                            if req.status == 403:
+                                # 立即重试（窗口测试：等待无助于恢复）
+                                continue
+                            if req.status == 429:
+                                await self._add_blocked_ip(p_ip, cooldown=1800)
+                                return False
+                            return False
+                except Exception:
+                    await asyncio.sleep(0.3)
+            return False
+
+        async def prefetch_one(p_ip):
+            """单个IP预热：认领IP -> 取号打码 -> 预热查询 -> 入队（认领转给worker）。"""
+            async with prefetching_lock:
+                if p_ip in prefetching_ips:
+                    return
+                prefetching_ips.add(p_ip)
+            enqueued = False
+            if not await claim_ip(p_ip):
+                return
+            try:
+                if await self._is_ip_blocked(p_ip):
+                    return
+                if p_ip in ip_token_cache:
+                    # 已有可复用token，不再重复打码
+                    return
+                ctx = QueryContext(p_ip, max_captcha_per_token=IP_QUERIES_PER_ROTATION + 2)
+                try:
+                    async with captcha_sem:
+                        ok, pu, tk, sn, hd = await self.check_img(ipv6=p_ip, ctx=ctx)
+                except Exception:
+                    ok = False
+                    pu = "prefetch_exc"
+                if not ok:
+                    return
+                cred = {"uuid": pu, "token": tk, "sign": sn}
+                hd["Content-Type"] = "application/json"
+                self._ip_fingerprints[p_ip] = {"headers": hd}
+                if warm_query_enabled and not shared_mode and not await warm_query(p_ip, cred, hd):
+                    await self._add_blocked_ip(p_ip, cooldown=120)
+                    return
+                if not shared_mode:
+                    # 共享模式：拦截返回的凭证不算真实打码（真实取号在共享初始化时已计1次）
+                    stats['tokens'] += 1
+                await prefetch_q.put((p_ip, ctx, cred, hd))
+                enqueued = True
+            finally:
+                # 入队后认领由worker接管；未入队则释放
+                async with prefetching_lock:
+                    prefetching_ips.discard(p_ip)
+                if not enqueued:
+                    await release_ip(p_ip)
+
+        async def prefetch_refiller():
+            """后台持续补token：预取队列低于目标水位时自动取号+打码，长任务不掉速。
+
+            目标水位 = min(prefetch_count, workers_used)。worker每消费一个热token，
+            这里就补一个，把“现场取号等待”变成后台流水线。
+            """
+            target = min(prefetch_count, max(workers_used, 8))
+            empty_rounds = 0
+            while not prefetch_stop.is_set():
+                # 动态水位：剩余域名只够N个token时，不再多打码浪费（长任务不受影响）
+                remaining = domain_q.qsize() + retry_heap.qsize()
+                needed_tokens = (remaining + rotation_cap - 1) // rotation_cap
+                target = min(prefetch_count, max(workers_used, 8), needed_tokens + 1)
+                in_pipeline = prefetch_q.qsize() + len(prefetching_ips)
+                if in_pipeline >= target:
+                    await asyncio.sleep(0.3)
+                    continue
+                # 没有待查域名且队列已空：不再浪费打码
+                if domain_q.empty() and retry_heap.empty() and prefetch_q.empty():
+                    empty_rounds += 1
+                    if empty_rounds >= 5:
+                        break
+                    await asyncio.sleep(0.5)
+                    continue
+                empty_rounds = 0
+                candidates = []
+                seen = set()
+                for ip in list(available_ips) + list(exit_slots):
+                    if ip in seen:
+                        continue
+                    seen.add(ip)
+                    if await is_ip_claimed(ip):
+                        continue
+                    if await self._is_ip_blocked(ip):
+                        continue
+                    async with prefetching_lock:
+                        if ip in prefetching_ips:
+                            continue
+                    if ip in ip_token_cache:
+                        # 该IP已有可复用token，再打码就是浪费
+                        continue
+                    candidates.append(ip)
+                random.shuffle(candidates)
+                candidates = _tunnel_first(candidates)
+                slots = target - (prefetch_q.qsize() + len(prefetching_ips))
+                if slots <= 0:
+                    await asyncio.sleep(0.3)
+                    continue
+                # 限制后台取号并发（auth是WAF重点盯防的环节，不宜过猛）
+                max_new = max(1, 4 - len(prefetch_refill_tasks))
+                for ip in candidates[:min(slots, max_new)]:
+                    task = asyncio.ensure_future(prefetch_one(ip))
+                    prefetch_refill_tasks.add(task)
+                    task.add_done_callback(prefetch_refill_tasks.discard)
+                await asyncio.sleep(0.2)
+
+        # 初始预热：每个IP一个任务，带去重与失败释放；
+        # 隧道槽位优先预热，Clash出口每个任务都真实出量
+        prefetch_tasks = [asyncio.ensure_future(prefetch_one(ip))
+                          for ip in _tunnel_first(available_ips)[:prefetch_count]]
         
         async def safe_update_progress():
             """安全调用进度回调（含已备案数实时推送）"""
@@ -1588,13 +2411,19 @@ class beian:
             硬429（访问频次过高）才拉黑IP（1800s），403挑战页不拉黑。"""
             nonlocal shared_blocked_waits, pace_ok, pace_attempts, slow_mode
             try:
+                if shared_mode:
+                    # 共享模式取号是瞬时的（无真实auth错峰），worker同时开火会撞429；
+                    # 按worker_id错峰0.15s，平滑首波查询
+                    await asyncio.sleep(worker_id * 0.15)
                 current_ip = None
                 current_ctx = None
                 current_cred = None
                 current_headers = None
                 queries_on_ip = 0
+                token_used = 0  # 当前token累计已用查询数（跨波次，用于TOKEN_QUERY_CAP）
                 ip_idx = 0
                 ip_switch_count = 0
+                auth_fail_streak = 0  # 连续 auth/打码失败计数，避免一次 ensure 打遍整个IP池
 
                 async def fail_batch(reason):
                     """把当前批次标记为最终失败（不再放回队列）"""
@@ -1607,10 +2436,19 @@ class beian:
                                 pass
                     async with stats_lock:
                         stats['fail'] += len(batch_items)
-                        stats['net_err'] += len(batch_items)
+                        # IP 池耗尽不是网络故障，不应混入“网络错”统计
+                        if reason != "ip_pool_exhausted":
+                            stats['net_err'] += len(batch_items)
                     await safe_update_progress()
                 
                 while True:
+                    # 全局 auth 风控熔断：auth 已被创宇盾连续拦截时，
+                    # 不再继续批量取域名制造 retry storm。
+                    _global_auth_wait = getattr(self, "_auth_global_cooldown_until", 0.0) - _time.monotonic()
+                    if _global_auth_wait > 0:
+                        await asyncio.sleep(min(_global_auth_wait, 5))
+                        continue
+
                     # 把到期的延迟重试转回主队列
                     while not retry_heap.empty():
                         top = retry_heap.get_nowait()
@@ -1657,15 +2495,22 @@ class beian:
                             break
                     
                     # ── 检查IP池是否全被封 ──
-                    if not any([not await self._is_ip_blocked(a) for a in self.local_ipv6_addresses]):
+                    if not any([not await self._is_ip_blocked(a) for a in exit_slots]):
                         shared_blocked_waits += 1
-                        wait = min(180 * shared_blocked_waits, 600)  # 180s起，逐步到10分钟
-                        logger.warning(f"⏳ W{worker_id}: 所有IP被封，等待{wait}s（第{shared_blocked_waits}次/40）")
-                        if shared_blocked_waits >= 40:
+                        wait = min(30 * shared_blocked_waits, 120)  # 30s起，上限2分钟
+                        logger.warning(f"⏳ W{worker_id}: 所有IP被封，等待{wait}s（第{shared_blocked_waits}次/60）")
+                        if shared_blocked_waits >= 60:
                             logger.warning(f"⏳ W{worker_id}: IP池持续耗尽（等待{shared_blocked_waits}次后放弃），本批标记失败")
                             await fail_batch("ip_pool_exhausted")
                             return
-                        await asyncio.sleep(wait)
+                        # 分段等待并定期重查：新替换的IP一旦可用就立刻恢复工作
+                        deadline = _time.monotonic() + wait
+                        while _time.monotonic() < deadline:
+                            # 2s细粒度轮询：IP恢复后可立即复工，避免固定10s空等
+                            await asyncio.sleep(min(2, deadline - _time.monotonic()))
+                            if any([not await self._is_ip_blocked(a)
+                                    for a in exit_slots]):
+                                break
                         # 把已取出但未处理的域名放回队列，等IP恢复后再试
                         for idx, domain in reversed(batch_items):
                             await domain_q.put((idx, domain))
@@ -1676,22 +2521,102 @@ class beian:
 
                     async def ensure_ip_ready():
                         """确保当前IP可用且token有效；否则轮换到下一个未封IP并重新打码。"""
-                        nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, ip_idx, ip_switch_count
-                        for _ in range(len(ip_slice) * 2):
+                        nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, token_used, rotation_cap, ip_idx, ip_switch_count, auth_fail_streak
+                        if getattr(self, "_auth_global_cooldown_until", 0.0) > _time.monotonic():
+                            return False
+                        for _ in range(max(len(ip_slice), len(exit_slots)) * 2):
                             now_ms = int(_time.time() * 1000)
                             if (current_ip is not None and current_ctx is not None
                                     and current_cred is not None
-                                    and queries_on_ip < IP_QUERIES_PER_ROTATION
+                                    and queries_on_ip < rotation_cap
+                                    and token_used < TOKEN_QUERY_CAP
                                     and current_ctx.token
                                     and current_ctx.token_expire > now_ms
                                     and not await self._is_ip_blocked(current_ip)):
                                 return True
-                            # 轮转找下一个未封IP（用完一轮后自然休息，避免单IP持续打）
+                            # 当前IP已失效（token过期/被封/用完配额）：释放独占认领
+                            if current_ip is not None:
+                                wave_done = queries_on_ip >= rotation_cap
+                                if token_used >= TOKEN_QUERY_CAP:
+                                    # 额度用完：token作废，IP自然休息
+                                    drop_token(current_ip)
+                                else:
+                                    # token仍有效：缓存供本IP复用（含波次结束），避免每轮重新打码
+                                    await cache_token(current_ip, current_ctx, current_cred,
+                                                      current_headers, token_used)
+                                    if wave_done:
+                                        # 主动轮换：给WAF的每IP窗口3秒复位时间，避免下波立刻403
+                                        await self._add_blocked_ip(current_ip, cooldown=3)
+                                await release_ip(current_ip)
+                                current_ip = None
+                                current_ctx = None
+                                current_cred = None
+                                queries_on_ip = 0
+                                token_used = 0
+                            # 轮转找下一个未封IP：先用本worker分片，再补充池中新地址
+                            # （封禁替换会动态新增IP，静态分片看不到新地址会再次卡死）
+                            candidates = list(ip_slice)
+                            seen = set(candidates)
+                            for _ip in exit_slots:
+                                if _ip not in seen:
+                                    candidates.append(_ip)
+                                    seen.add(_ip)
+
+                            # 🔥 优先复用缓存token的IP：避免每波都重新取号（取号是auth瓶颈）。
+                            # worker在自留IP里反复循环，绝大部分查询走缓存token，零取号等待。
+                            cached_ip = None
+                            for cand in candidates:
+                                if await self._is_ip_blocked(cand):
+                                    continue
+                                _cached = ip_token_cache.get(cand)
+                                if _cached is None:
+                                    continue
+                                _c_ctx, _c_cred, _c_hd, _c_used = _cached
+                                if _c_used >= TOKEN_QUERY_CAP:
+                                    ip_token_cache.pop(cand, None)
+                                    continue
+                                if _c_ctx.token_expire <= int(_time.time() * 1000):
+                                    ip_token_cache.pop(cand, None)
+                                    continue
+                                if await claim_ip(cand):
+                                    cached_ip = cand
+                                    break
+                            if cached_ip is not None:
+                                current_ip = cached_ip
+                                _c_ctx, _c_cred, _c_hd, _c_used = ip_token_cache.pop(cached_ip)
+                                current_ctx = _c_ctx
+                                current_cred = _c_cred
+                                current_headers = _c_hd
+                                queries_on_ip = 0
+                                token_used = _c_used
+                                auth_fail_streak = 0
+                                logger.info(f"♻️ W{worker_id} 优先复用缓存Token (IP={current_ip[-12:]}, 已用{_c_used})")
+                                return True
+
+                            # 缓存token用尽后才取预取token（预取=新打码，优先级低于复用）
+                            while not prefetch_q.empty():
+                                try:
+                                    p_ip, p_ctx, p_cred, p_hd = prefetch_q.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
+                                if not await self._is_ip_blocked(p_ip):
+                                    current_ip = p_ip
+                                    current_ctx = p_ctx
+                                    current_cred = p_cred
+                                    current_headers = p_hd
+                                    queries_on_ip = 0
+                                    token_used = 1  # 预热查询已消耗1条
+                                    auth_fail_streak = 0
+                                    return True
+                                await release_ip(p_ip)
+
                             next_ip = None
-                            for _ in range(len(ip_slice)):
-                                ip_idx = (ip_idx + 1) % len(ip_slice)
-                                cand = ip_slice[ip_idx]
-                                if not await self._is_ip_blocked(cand):
+                            for _ in range(len(candidates)):
+                                ip_idx = (ip_idx + 1) % len(candidates)
+                                cand = candidates[ip_idx]
+                                if await self._is_ip_blocked(cand):
+                                    continue
+                                if await claim_ip(cand):
                                     next_ip = cand
                                     break
                             if next_ip is None:
@@ -1701,8 +2626,30 @@ class beian:
                                 return False
                             current_ip = next_ip
                             queries_on_ip = 0
+                            token_used = 0
+                            # 优先复用缓存token：403短冷却后回来，无需重新取号+打码
+                            cached = ip_token_cache.get(current_ip)
+                            if cached is not None:
+                                c_ctx, c_cred, c_hd, c_used = cached
+                                if (c_used < TOKEN_QUERY_CAP
+                                        and c_ctx.token_expire > int(_time.time() * 1000)
+                                        and not await self._is_ip_blocked(current_ip)):
+                                    current_ctx = c_ctx
+                                    current_cred = c_cred
+                                    current_headers = c_hd
+                                    queries_on_ip = 0  # 新一波从0开始
+                                    token_used = c_used
+                                    ip_token_cache.pop(current_ip, None)
+                                    auth_fail_streak = 0
+                                    logger.info(f"♻️ W{worker_id} 复用缓存Token (IP={current_ip[-12:]}, 已用{c_used})")
+                                    return True
+                                ip_token_cache.pop(current_ip, None)
+                            # 先用打码同款头占位，避免查询与auth/打码指纹不一致
                             current_headers = self.get_fingerprint(current_ip)["headers"]
                             ctx = QueryContext(current_ip, max_captcha_per_token=IP_QUERIES_PER_ROTATION + 2)
+                            _was_shared = bool(
+                                shared_mode and self._shared_active
+                                and self._shared_cred is not None)
                             try:
                                 async with captcha_sem:
                                     ok, pu, tk, sn, hd = await self.check_img(ipv6=current_ip, ctx=ctx)
@@ -1712,19 +2659,50 @@ class beian:
                             if ok:
                                 current_ctx = ctx
                                 current_cred = {"uuid": pu, "token": tk, "sign": sn}
-                                # 查询用该IP自己的稳定指纹头（cookie等），打码用默认随机头
-                                current_headers = self.get_fingerprint(current_ip)["headers"]
-                                stats['tokens'] += 1
+                                # 查询沿用auth/打码同一套请求头（含cookie），
+                                # 并让update_fingerprint_cookies写进同一个dict，保证指纹一致
+                                current_headers = hd
+                                current_headers["Content-Type"] = "application/json"
+                                self._ip_fingerprints[current_ip] = {"headers": current_headers}
+                                if not _was_shared:
+                                    # 共享模式：拦截返回的凭证不算真实打码
+                                    stats['tokens'] += 1
                                 ip_switch_count += 1
-                                logger.info(f"🔑 W{worker_id} 新Token (IP={current_ip[-12:]})")
+                                auth_fail_streak = 0
+                                logger.info(f"{'♻️' if _was_shared else '🔑'} W{worker_id} "
+                                            f"{'复用共享Token' if _was_shared else '新Token'} "
+                                            f"(IP={current_ip[-12:]})")
                                 return True
                             # 打码失败：短冷却后换下一个IP
                             logger.warning(f"⏳ W{worker_id} 打码失败({pu})，换IP")
-                            await self._add_blocked_ip(current_ip, cooldown=60)
+                            low_pu = str(pu).lower()
+                            auth_fail_streak += 1
+                            if any(k in str(pu) for k in ("创宇盾拦截", "黑客攻击")):
+                                # 瞬时风控：只短冷却，IP稍后仍可用（不是300s封禁）
+                                await self._add_blocked_ip(current_ip, cooldown=5)
+                            elif any(k in low_pu for k in (
+                                    "请求的地址无效", "invalid argument",
+                                    "cannot assign requested address", "cannot bind",
+                                    "invalid address", "address is not valid")):
+                                await self._add_blocked_ip(current_ip, cooldown=1800)
+                            else:
+                                # 绝大多数“打码失败/连接抖动/响应非JSON”是瞬时问题，
+                                # 原 120s 冷却会把整个 IP 池快速抽干，导致“池耗尽”式大面积失败。
+                                # 短冷却让 IP 很快回来，避免池子被自己打空。
+                                await self._add_blocked_ip(current_ip, cooldown=3)
+                            await release_ip(current_ip)
                             current_ip = None
                             current_ctx = None
                             current_cred = None
                             await asyncio.sleep(0.3)
+                            # 连续 auth 失败说明 WAF 已经开始惩罚整个 IP 池，
+                            # 继续轮换只会把更多 IP 打进封禁缓存；及时退出让 worker 休息。
+                            if auth_fail_streak >= 4:
+                                logger.warning(
+                                    f"⏳ W{worker_id} 连续 {auth_fail_streak} 次取号失败，"
+                                    "暂停本批换IP，等待 WAF 冷却"
+                                )
+                                return False
                         current_ip = None
                         current_ctx = None
                         current_cred = None
@@ -1732,7 +2710,10 @@ class beian:
 
                     async def query_one_with_retry(idx, domain):
                         """单条查询：403/HTML同IP短重试；硬429才拉黑IP并换IP。"""
-                        nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, ip_idx, ip_switch_count
+                        nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, token_used, rotation_cap, ip_idx, ip_switch_count
+                        if shared_mode and not await self._shared_try_consume(idx):
+                            self._shared_invalidate()
+                            return (idx, domain, False, "shared_cap")
                         info = ujson.loads(self.typj.get(sp))
                         info["pageNum"] = 1; info["pageSize"] = pageSize
                         info["unitName"] = domain
@@ -1743,15 +2724,37 @@ class beian:
                             if not await ensure_ip_ready():
                                 return (idx, domain, False, "ip_pool_exhausted")
                             queries_on_ip += 1
+                            token_used += 1
                             h = dict(current_headers)
                             h.update({"Content-Length": str(len(str(body).encode("utf-8"))),
                                       "uuid": current_cred["uuid"], "token": current_cred["token"], "sign": current_cred["sign"]})
                             try:
+                                await pace.acquire()
+                                _req_t0 = _time.perf_counter()
                                 async with self.get_session(ipv6=current_ip) as session:
+                                    _actual_ip = self._get_session_local_ip(session)
+                                    if _actual_ip and current_ip and _actual_ip != current_ip:
+                                        logger.warning(f"⚠️ IPv6绑定不一致: expected={current_ip} actual={_actual_ip}")
                                     async with session.post(
                                         self.queryByCondition, data=body, headers=h,
                                         timeout=aiohttp.ClientTimeout(total=5)
                                     ) as req:
+                                        _elapsed_ms = (_time.perf_counter() - _req_t0) * 1000.0
+                                        current_ctx.queries += 1
+                                        current_ctx.last_used = _time.time()
+                                        current_ctx.last_status = req.status
+                                        metrics.record(current_ip, req.status, _elapsed_ms, retry=(attempt > 0))
+                                        stats['http_attempts'] += 1
+                                        stats['latency_ms'] += _elapsed_ms
+                                        stats['latency_max_ms'] = max(stats['latency_max_ms'], _elapsed_ms)
+                                        if req.status == 200:
+                                            stats['http_200'] += 1
+                                        elif req.status == 403:
+                                            stats['http_403'] += 1
+                                        elif req.status == 429:
+                                            stats['http_429'] += 1
+                                        elif req.status >= 500:
+                                            stats['http_5xx'] += 1
                                         # 捕获WAF下发的cookie并保存到该IP档案，原样带回
                                         try:
                                             sc = req.headers.getall("Set-Cookie", [])
@@ -1760,14 +2763,24 @@ class beian:
                                         except Exception:
                                             pass
                                         if req.status == 429:
+                                            drop_token(current_ip)
+                                            if rotation_cap > 6:
+                                                rotation_cap = max(6, rotation_cap - 5)
+                                                logger.warning(f"⚠️ W{worker_id} 硬429频发，每IP配额降至{rotation_cap}条")
                                             await self._add_blocked_ip(current_ip, cooldown=1800)
+                                            await release_ip(current_ip)
                                             current_ip = None; current_ctx = None; current_cred = None
                                             return (idx, domain, False, "ip_429")
                                         if req.status == 403:
-                                            # 创宇盾瞬时挑战页：同IP短重试，不拉黑
+                                            # 创宇盾瞬时限流：每6~8条偶发403，1~2秒内自动恢复。
+                                            # 同IP等0.4秒重试（保留token），4次仍失败才交给延迟重试。
                                             last_reason = "ip_403_streak"
-                                            await asyncio.sleep(0.4)
-                                            continue
+                                            if attempt < 1:
+                                                await asyncio.sleep(0.4)
+                                                continue
+                                            await cache_token(current_ip, current_ctx, current_cred,
+                                                               current_headers, token_used)
+                                            return (idx, domain, False, "ip_403_streak")
                                         if req.status in (502, 503, 504):
                                             if attempt < 3:
                                                 stats['retry'] += 1
@@ -1777,11 +2790,24 @@ class beian:
                                         if req.status != 200:
                                             return (idx, domain, False, f"HTTP_{req.status}")
                                         res_text = await req.text()
-                            except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+                            except asyncio.CancelledError:
+                                # aiohttp超时/连接中断会以CancelledError形式泄漏；
+                                # 只有任务本身被取消(cancelling()>0)才向上传播
+                                _t = asyncio.current_task()
+                                if _t is not None and _t.cancelling() > 0:
+                                    raise
                                 if attempt < 3:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.3)
                                     continue
+                                return (idx, domain, False, "network_error")
+                            except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+                                metrics.record(current_ip, "network", 0.0, retry=(attempt > 0))
+                                if attempt < 2:
+                                    stats['retry'] += 1
+                                    await asyncio.sleep(0.3 * (attempt + 1))
+                                    continue
+                                await self._mark_ip_unreachable(current_ip)
                                 return (idx, domain, False, "network_error")
                             except Exception as e:
                                 return (idx, domain, False, str(e)[:80])
@@ -1789,10 +2815,14 @@ class beian:
                             try:
                                 data = ujson.loads(res_text)
                             except Exception:
-                                # 非JSON（HTML挑战页）：同IP短重试，不拉黑
+                                # 非JSON（HTML挑战页）：同上，最多5次机会，再失败换IP
                                 last_reason = "ip_403_streak"
-                                await asyncio.sleep(0.4)
-                                continue
+                                if attempt < 3:
+                                    continue
+                                await cache_token(current_ip, current_ctx, current_cred,
+                                                   current_headers, token_used)
+                                await self._add_blocked_ip(current_ip, cooldown=3)
+                                return (idx, domain, False, "ip_403_streak")
                             if data.get("code") in (500, 502, 503, 504):
                                 # 上游瞬时错误：短重试，仍失败则延迟重查
                                 last_reason = f"HTTP_{data.get('code')}"
@@ -1803,13 +2833,21 @@ class beian:
                                 return (idx, domain, False, last_reason)
                             if data.get("code") == 429:
                                 # 应用层限流：该IP拉黑1800s，换IP重查
+                                drop_token(current_ip)
+                                if rotation_cap > 6:
+                                    rotation_cap = max(6, rotation_cap - 5)
+                                    logger.warning(f"⚠️ W{worker_id} 硬429频发，每IP配额降至{rotation_cap}条")
                                 await self._add_blocked_ip(current_ip, cooldown=1800)
+                                await release_ip(current_ip)
                                 current_ip = None; current_ctx = None; current_cred = None
                                 return (idx, domain, False, "ip_429")
                             if data.get("code") in (401, 403) or any(
                                     k in str(data.get("msg") or data.get("message") or "")
                                     for k in ("token", "uuid", "非法", "失效")):
                                 # token失效：刷新当前IP的token后重试
+                                if shared_mode:
+                                    self._shared_invalidate()
+                                drop_token(current_ip)
                                 if current_ctx:
                                     current_ctx.force_refresh = True
                                 current_ctx = None
@@ -1822,11 +2860,218 @@ class beian:
                             return (idx, domain, False, data)
                         return (idx, domain, False, last_reason)
 
+                    async def query_one_parallel(idx, domain):
+                        """并发模式单条查询：固定使用当前token/IP，403带cookie重试；
+                        硬429/token失效只处理一次（共享flag），其余并发任务直接返回。"""
+                        nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, rotation_cap, ip_dead, token_dead, challenge_dead
+                        if shared_mode and not await self._shared_try_consume(idx):
+                            self._shared_invalidate()
+                            return (idx, domain, False, "shared_cap")
+                        p_ip, p_ctx, p_cred = current_ip, current_ctx, current_cred
+                        info = ujson.loads(self.typj.get(sp))
+                        info["pageNum"] = 1; info["pageSize"] = pageSize
+                        info["unitName"] = domain
+                        body = ujson.dumps(info, ensure_ascii=False)
+
+                        last_reason = "max_retries"
+                        for attempt in range(4):
+                            if ip_dead:
+                                return (idx, domain, False, "ip_429")
+                            if token_dead:
+                                return (idx, domain, False, "token_invalid")
+                            if challenge_dead:
+                                return (idx, domain, False, "ip_403_streak")
+                            h = dict(current_headers)
+                            h.update({"Content-Length": str(len(str(body).encode("utf-8"))),
+                                      "uuid": p_cred["uuid"], "token": p_cred["token"], "sign": p_cred["sign"]})
+                            try:
+                                await pace.acquire()
+                                _req_t0 = _time.perf_counter()
+                                async with self.get_session(ipv6=p_ip) as session:
+                                    _actual_ip = self._get_session_local_ip(session)
+                                    if _actual_ip and p_ip and _actual_ip != p_ip:
+                                        logger.warning(f"⚠️ IPv6绑定不一致: expected={p_ip} actual={_actual_ip}")
+                                    async with session.post(
+                                        self.queryByCondition, data=body, headers=h,
+                                        timeout=aiohttp.ClientTimeout(total=5)
+                                    ) as req:
+                                        _elapsed_ms = (_time.perf_counter() - _req_t0) * 1000.0
+                                        metrics.record(p_ip, req.status, _elapsed_ms, retry=(attempt > 0))
+                                        stats['http_attempts'] += 1
+                                        stats['latency_ms'] += _elapsed_ms
+                                        stats['latency_max_ms'] = max(stats['latency_max_ms'], _elapsed_ms)
+                                        if req.status == 200:
+                                            stats['http_200'] += 1
+                                        elif req.status == 403:
+                                            stats['http_403'] += 1
+                                        elif req.status == 429:
+                                            stats['http_429'] += 1
+                                        elif req.status >= 500:
+                                            stats['http_5xx'] += 1
+                                        try:
+                                            sc = req.headers.getall("Set-Cookie", [])
+                                            if sc:
+                                                self.update_fingerprint_cookies(p_ip, sc)
+                                        except Exception:
+                                            pass
+                                        if req.status == 429:
+                                            if not ip_dead:
+                                                ip_dead = True
+                                                drop_token(p_ip)
+                                                if rotation_cap > 6:
+                                                    rotation_cap = max(6, rotation_cap - 5)
+                                                    logger.warning(f"⚠️ W{worker_id} 硬429频发，每IP配额降至{rotation_cap}条")
+                                                await self._add_blocked_ip(p_ip, cooldown=1800)
+                                                await release_ip(p_ip)
+                                                current_ip = None; current_ctx = None; current_cred = None
+                                            return (idx, domain, False, "ip_429")
+                                        if req.status == 403:
+                                            # 创宇盾瞬时限流：同IP等0.4秒重试
+                                            last_reason = "ip_403_streak"
+                                            if attempt < 3:
+                                                await asyncio.sleep(0.4)
+                                                continue
+                                            if not challenge_dead:
+                                                challenge_dead = True
+                                            return (idx, domain, False, "ip_403_streak")
+                                        if req.status in (502, 503, 504):
+                                            if attempt < 3:
+                                                stats['retry'] += 1
+                                                await asyncio.sleep(0.5)
+                                                continue
+                                            return (idx, domain, False, f"HTTP_{req.status}")
+                                        if req.status != 200:
+                                            return (idx, domain, False, f"HTTP_{req.status}")
+                                        res_text = await req.text()
+                            except asyncio.CancelledError:
+                                # 同上：超时/中断导致的取消按网络错误重试，真取消才传播
+                                _t = asyncio.current_task()
+                                if _t is not None and _t.cancelling() > 0:
+                                    raise
+                                if attempt < 3:
+                                    stats['retry'] += 1
+                                    await asyncio.sleep(0.3)
+                                    continue
+                                return (idx, domain, False, "network_error")
+                            except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+                                if attempt < 3:
+                                    stats['retry'] += 1
+                                    await asyncio.sleep(0.3)
+                                    continue
+                                return (idx, domain, False, "network_error")
+                            except Exception as e:
+                                return (idx, domain, False, str(e)[:80])
+
+                            try:
+                                data = ujson.loads(res_text)
+                            except Exception:
+                                # 非JSON（HTML拦截页）：同上，最多5次机会，再失败换IP
+                                last_reason = "ip_403_streak"
+                                if attempt < 3:
+                                    continue
+                                if not challenge_dead:
+                                    challenge_dead = True
+                                    await self._add_blocked_ip(p_ip, cooldown=3)
+                                return (idx, domain, False, "ip_403_streak")
+                            if data.get("code") in (500, 502, 503, 504):
+                                last_reason = f"HTTP_{data.get('code')}"
+                                if attempt < 3:
+                                    stats['retry'] += 1
+                                    await asyncio.sleep(0.5)
+                                    continue
+                                return (idx, domain, False, last_reason)
+                            if data.get("code") == 429:
+                                if not ip_dead:
+                                    ip_dead = True
+                                    drop_token(p_ip)
+                                    if rotation_cap > 6:
+                                        rotation_cap = max(6, rotation_cap - 5)
+                                        logger.warning(f"⚠️ W{worker_id} 硬429频发，每IP配额降至{rotation_cap}条")
+                                    await self._add_blocked_ip(p_ip, cooldown=1800)
+                                    await release_ip(current_ip)
+                                    current_ip = None; current_ctx = None; current_cred = None
+                                return (idx, domain, False, "ip_429")
+                            if data.get("code") in (401, 403) or any(
+                                    k in str(data.get("msg") or data.get("message") or "")
+                                    for k in ("token", "uuid", "非法", "失效")):
+                                if not token_dead:
+                                    token_dead = True
+                                    if shared_mode:
+                                        self._shared_invalidate()
+                                    drop_token(p_ip)
+                                    if current_ctx:
+                                        current_ctx.force_refresh = True
+                                    current_ctx = None
+                                    current_cred = None
+                                return (idx, domain, False, "token_invalid")
+                            if data.get('success', False) or data.get('code') == 200:
+                                return (idx, domain, True, data)
+                            return (idx, domain, False, data)
+                        return (idx, domain, False, last_reason)
+
                     _t_batch = _time.time()
                     all_batch_results = []
-                    for idx, domain in batch_items:
-                        all_batch_results.append(await query_one_with_retry(idx, domain))
-                        await asyncio.sleep(IP_QUERY_LAUNCH_INTERVAL * (3 if slow_mode else 1))
+                    if IP_QUERY_CONCURRENCY > 1:
+                        # 并发模式：先确保拿到一个token/IP，然后整批同时发起
+                        if not await ensure_ip_ready():
+                            all_batch_results = [(idx, domain, False, "ip_pool_exhausted")
+                                                 for idx, domain in batch_items]
+                            await asyncio.sleep(3.0)
+                        else:
+                            ip_dead = False
+                            token_dead = False
+                            challenge_dead = False
+                            raw = []
+                            # 按 IP_QUERY_CONCURRENCY 分片并发，避免把整批 20 条同时打向同一个 IP。
+                            for _i in range(0, len(batch_items), IP_QUERY_CONCURRENCY):
+                                if not await ensure_ip_ready():
+                                    raw.extend((idx, domain, False, "ip_pool_exhausted")
+                                               for idx, domain in batch_items[_i:])
+                                    await asyncio.sleep(3.0)
+                                    break
+                                ip_dead = False
+                                token_dead = False
+                                challenge_dead = False
+                                _chunk = batch_items[_i:_i + IP_QUERY_CONCURRENCY]
+                                _chunk_raw = await asyncio.gather(
+                                    *(query_one_parallel(idx, domain) for idx, domain in _chunk),
+                                    return_exceptions=True,
+                                )
+                                raw.extend(_chunk_raw)
+                                await asyncio.sleep(max(
+                                    random.uniform(0.05, 0.25),
+                                    IP_QUERY_LAUNCH_INTERVAL * (3 if slow_mode else 1),
+                                ))
+
+                            all_batch_results = []
+                            for r, (idx, domain) in zip(raw, batch_items):
+                                if isinstance(r, tuple):
+                                    all_batch_results.append(r)
+                                elif isinstance(r, asyncio.CancelledError):
+                                    all_batch_results.append((idx, domain, False, "network_error"))
+                                else:
+                                    all_batch_results.append((idx, domain, False, f"parallel_err:{type(r).__name__}"))
+                            queries_on_ip += len(batch_items)
+                            token_used += len(batch_items)
+                            if ip_dead or token_dead or challenge_dead:
+                                if challenge_dead and not ip_dead and not token_dead:
+                                    # 403短冷却轮换：token不丢，冷却结束回同一IP直接复用
+                                    await cache_token(current_ip, current_ctx, current_cred,
+                                                      current_headers, token_used)
+                                await release_ip(current_ip)
+                                current_ip = None
+                                current_ctx = None
+                                current_cred = None
+                                queries_on_ip = 0
+                                token_used = 0
+                    else:
+                        for idx, domain in batch_items:
+                            r = await query_one_with_retry(idx, domain)
+                            all_batch_results.append(r)
+                            if isinstance(r, tuple) and len(r) >= 3 and r[2] == "ip_pool_exhausted":
+                                await asyncio.sleep(3.0)
+                            else:
+                                await asyncio.sleep(IP_QUERY_LAUNCH_INTERVAL * (3 if slow_mode else 1))
 
                     # 自适应调速：近20条成功率<30%则降速保护子网信誉，>60%恢复全速
                     pace_attempts += len(all_batch_results)
@@ -1855,13 +3100,16 @@ class beian:
                         if not success and isinstance(result, str) and (
                                 result.startswith("ip_")
                                 or result == "network_error"
-                                or result.startswith("HTTP_5")):
+                                or result.startswith("HTTP_5")
+                                or result == "token_invalid"
+                                or result == "shared_cap"
+                                or result.startswith("parallel_err")):
                             rc = requeue_tracker.get(idx, 0)
                             if rc < MAX_REQUEUE_ATTEMPTS:
                                 requeue_tracker[idx] = rc + 1
                                 requeue_count += 1
                                 kind = "429" if result == "ip_429" else (
-                                    "403" if result == "ip_403_streak" else "net")
+                                    "403" if result in ("ip_403_streak", "shared_cap") else "net")
                                 try:
                                     await schedule_retry(idx, domain, rc, kind)
                                 except Exception:
@@ -1895,6 +3143,7 @@ class beian:
                             r = results[idx]
                             if r and r[1]:
                                 stats['ok'] += 1
+                                metrics.completed += 1
                                 rd = r[2]
                                 if isinstance(rd, dict):
                                     rlist = rd.get("params", {}).get("list")
@@ -1935,6 +3184,11 @@ class beian:
                         await domain_q.put((idx, domain))
                 except Exception:
                     pass
+            finally:
+                # worker退出时释放独占认领，避免IP被永久占用
+                if current_ip is not None:
+                    await release_ip(current_ip)
+                    current_ip = None
         
         # 启动所有IP worker
         workers_used = min(max_workers, len(available_ips))
@@ -1942,14 +3196,35 @@ class beian:
         logger.info(f"🌊 流式启动: {total}域名 {workers_used}w 每IP独立token "
                     f"每IP≤{IP_QUERIES_PER_ROTATION}条/轮 间隔{IP_QUERY_LAUNCH_INTERVAL}s "
                     f"打码≤{OPTIMAL_CAPTCHA_CONC} IP独占轮转")
+
+        # 等待预热完成（限时12秒）：预热失败/超时后worker再按需取号
+        if prefetch_tasks:
+            _done, _pending = await asyncio.wait(prefetch_tasks, timeout=12)
+            for _t in _pending:
+                _t.cancel()
+            if _pending:
+                await asyncio.gather(*_pending, return_exceptions=True)
         
         worker_tasks = []
         for i in range(workers_used):
             worker_tasks.append(asyncio.ensure_future(ip_worker(ip_slices[i], i)))
+
+        # 后台持续补token：预热队列低于水位自动取号，长任务不掉速
+        refiller_task = asyncio.ensure_future(prefetch_refiller())
         
         # 使用 return_exceptions=True 防止单个worker崩溃影响整体
         try:
             gathered = await asyncio.gather(*worker_tasks, return_exceptions=True)
+            prefetch_stop.set()
+            for _t in list(prefetch_refill_tasks) + list(prefetch_tasks):
+                if not _t.done():
+                    _t.cancel()
+            if not refiller_task.done():
+                refiller_task.cancel()
+            await asyncio.gather(
+                *([refiller_task] + list(prefetch_refill_tasks) + list(prefetch_tasks)),
+                return_exceptions=True,
+            )
             for i, result in enumerate(gathered):
                 if isinstance(result, Exception):
                     logger.error(f"💥 Worker {i} 异常退出: {result}")
@@ -1999,10 +3274,16 @@ class beian:
             elapsed = _time.time() - t_start
             qps = total / elapsed if elapsed > 0 else 0
             qph = qps * 3600
-            logger.info(f"📊 完成: {stats['ok']}/{total} API成功({stats['ok']*100//max(1,total)}%), "
-                        f"备案{stats['reg']}, 网络错{stats['net_err']}, "
-                        f"重试{stats['retry']}次, 打码{stats['tokens']}次(每IP独立token), "
-                        f"耗时{elapsed:.1f}s, 速度{qps:.0f}q/s ≈ {qph:.0f}QPH")
+            avg_latency = stats['latency_ms'] / max(1, stats['http_attempts'])
+            logger.info(
+                f"📊 完成: {stats['ok']}/{total} API成功({stats['ok']*100//max(1,total)}%), "
+                f"备案{stats['reg']}, 网络错{stats['net_err']}, "
+                f"业务重试{stats['retry']}次, HTTP尝试{stats['http_attempts']}, "
+                f"200={stats['http_200']} 403={stats['http_403']} 429={stats['http_429']} 5xx={stats['http_5xx']}, "
+                f"HTTP平均{avg_latency:.0f}ms/P95={metrics.p95_latency_ms:.0f}ms/最大{stats['latency_max_ms']:.0f}ms, "
+                f"打码{stats['tokens']}次, 耗时{elapsed:.1f}s, 业务速度{qps:.1f}q/s ≈ {qph:.0f}QPH, "
+                f"session_hit={getattr(self, '_session_pool_hits', 0)} session_miss={getattr(self, '_session_pool_misses', 0)}"
+            )
         except Exception as e:
             logger.error(f"💥 stream_query异常: {e}\n{traceback.format_exc()}")
         
@@ -2043,6 +3324,14 @@ class beian:
                 task.cancel()
         self._captcha_filler_tasks.clear()
         # 关闭 session 池中的所有连接
+        if hasattr(self, '_session_close_tasks'):
+            for task in list(self._session_close_tasks):
+                if not task.done():
+                    task.cancel()
+            if self._session_close_tasks:
+                await asyncio.gather(*list(self._session_close_tasks), return_exceptions=True)
+            self._session_close_tasks.clear()
+
         if hasattr(self, '_session_pool'):
             for key, session in list(self._session_pool.items()):
                 try:
@@ -2051,7 +3340,10 @@ class beian:
                 except Exception:
                     pass
             self._session_pool.clear()
-        logger.info("beian 资源清理完成")
+        logger.info(
+            f"beian 资源清理完成 | session_hit={getattr(self, '_session_pool_hits', 0)} "
+            f"session_miss={getattr(self, '_session_pool_misses', 0)}"
+        )
 
     def __del__(self):
         """析构函数，确保资源清理"""

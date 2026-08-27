@@ -65,7 +65,9 @@ def setup_logging():
 def create_app():
     """创建并配置应用"""
     # 创建应用实例
-    app = web.Application()
+    # 默认 client_max_size 只有 1MiB，批量提交超过约 5 万条域名时会被 aiohttp 以 413 拒绝；
+    # 这里调大到 128MiB，配合路由内 10 万条的硬上限足够使用。
+    app = web.Application(client_max_size=128 * 1024 * 1024)
     
     # 初始化查询处理器
     myicp = beian()
@@ -91,7 +93,14 @@ def create_app():
     
     # 初始化数据库
     app["db"] = Database()
-    
+    # 进程崩溃/重启后，把遗留的 running 批量任务标记为中断，避免僵尸记录累积
+    try:
+        recovered = app["db"].recover_stale_batch_tasks()
+        if recovered:
+            logger.info(f"启动时已回收 {recovered} 个僵尸 running 批量任务")
+    except Exception as e:
+        logger.warning(f"回收遗留批量任务失败: {e}")
+
     # 设置模板
     aiohttp_jinja2.setup(app, loader=jinja2.FileSystemLoader(get_resource_path("templates")))
     

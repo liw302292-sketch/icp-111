@@ -9,6 +9,7 @@ import os
 import subprocess
 import locale
 import uuid
+import ipaddress
 from mlog import logger
 
 
@@ -169,11 +170,21 @@ def get_local_ipv6_addresses():
                 return []
             for line in output.splitlines():
                 line_strip = line.strip()
+                # 只接受 DAD 状态为 Preferred/首选 的地址：
+                # Deprecated/Tentative/Duplicate/Invalid 的地址无法绑定出口，白浪费打码次数。
+                if not any(k in line_strip for k in ("Preferred", "首选")):
+                    continue
                 if any(k in line_strip for k in ("公用", "手动", "Public", "Manual")) and ":" in line_strip:
                     parts = line_strip.split()
-                    candidate = parts[-1].split("/")[0]
-                    if ":" in candidate and is_public_ipv6(candidate):
-                        addresses.append(candidate)
+                    for tok in parts:
+                        candidate = tok.split("/")[0]
+                        try:
+                            ipaddress.IPv6Address(candidate)
+                        except Exception:
+                            continue
+                        if is_public_ipv6(candidate) and not candidate.startswith("2001:db8"):
+                            addresses.append(candidate)
+                            break
         else:
             output = _run_cmd_capture(["ip", "-6", "addr", "show"])
             if not output:
@@ -183,10 +194,58 @@ def get_local_ipv6_addresses():
                 if ("inet6" in line_strip) and ("scope global" in line_strip):
                     try:
                         candidate = line_strip.split()[1].split("/")[0]
-                        if is_public_ipv6(candidate):
+                        ipaddress.IPv6Address(candidate)
+                        if is_public_ipv6(candidate) and not candidate.startswith("2001:db8"):
                             addresses.append(candidate)
                     except:
                         continue
+    except Exception:
+        return []
+    return list(dict.fromkeys(addresses))
+
+
+def get_manual_ipv6_addresses(adapter_name=None):
+    """获取本机通过 netsh 手工添加的 IPv6 地址（不含路由器公告地址）。
+
+    程序用 configure_ipv6_addresses() 生成的地址在 netsh 中显示为
+    Manual/手动；而运营商下发的地址显示为 Public/Temporary。清理池子时
+    只应删除 Manual 地址，保留 RouterAdvertisement 基础地址。
+    """
+    addresses = []
+    try:
+        if os.name != 'nt':
+            return addresses
+        output = _run_cmd_capture(["netsh", "interface", "ipv6", "show", "addresses"])
+        if not output:
+            return addresses
+
+        current_adapter = None
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            # 格式：Interface 16: 以太网
+            m = re.match(r'^Interface\s+\d+\s*:\s*(.*)$', line, re.IGNORECASE)
+            if m:
+                current_adapter = m.group(1).strip()
+                continue
+            if adapter_name is not None and current_adapter != adapter_name:
+                continue
+            # 只处理 DAD 正常的手工地址；Public/Temporary 是基础地址，不能删
+            if not any(k in line for k in ("Manual", "手动")):
+                continue
+            if not any(k in line for k in ("Preferred", "首选")):
+                continue
+            parts = line.split()
+            for tok in parts:
+                candidate = tok.split("/")[0]
+                try:
+                    ipaddress.IPv6Address(candidate)
+                except Exception:
+                    continue
+                if is_public_ipv6(candidate) and not candidate.startswith("2001:db8"):
+                    addresses.append(candidate)
+                break
     except Exception:
         return []
     return list(dict.fromkeys(addresses))
@@ -209,4 +268,3 @@ def configure_ipv6_addresses(prefix, count, adapter_name):
             subprocess.run([
                 "ip", "-6", "addr", "add", new_temp_ipv6, "dev", adapter_name
             ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
