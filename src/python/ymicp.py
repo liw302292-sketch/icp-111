@@ -25,6 +25,7 @@ from collections import deque
 from load_config import config
 from cachetools import TTLCache
 from utils import get_project_root
+from dataclasses import dataclass, field
 
 ssl._create_default_https_context = ssl._create_unverified_context()
 
@@ -325,6 +326,47 @@ def get_local_ipv6_addresses():
     return list(dict.fromkeys(addresses))
 
 
+@dataclass
+class IPState:
+    """单个 IPv6 出口的网络状态（不含认证信息）。
+
+    目标是让“每个 IP 的状态”独立于“每次请求/凭证”，避免全局 _ip_queries_used 之类的
+    单值状态在不同任务间互相污染。
+    """
+    ipv6: str
+    request_count: int = 0
+    consecutive_failures: int = 0
+    consecutive_403: int = 0
+    last_success: float = 0.0
+    cooldown_until: float = 0.0
+    health: str = "unknown"
+
+    @property
+    def healthy(self) -> bool:
+        return self.health not in ("cooldown", "unreachable", "bad")
+
+
+@dataclass
+class CredentialState:
+    """单个认证凭证的生命周期状态（与 IP 解耦）。
+
+    query 执行阶段只读取 credential，不负责验证码/取号细节。
+    """
+    token: str = ""
+    token_expire: int = 0
+    token_ipv6: str | None = None
+    captcha_count: int = 0
+    auth_count: int = 0
+    captcha_attempts: int = 0
+    captcha_success: int = 0
+    credential_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    status: str = "idle"
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.token) and self.token_expire > int(time.time() * 1000)
+
+
 class QueryContext:
     """隔离的查询上下文 - 每个IP+Token组合独立一份，支持并发安全"""
     __slots__ = ('ipv6', 'token', 'token_expire', 'token_ipv6',
@@ -548,9 +590,11 @@ class beian:
         self._queries_per_ip = getattr(
             getattr(config, 'captcha', object()), 'queries_per_ip', 20
         ) or 20
-        self._ip_queries_used = 0  # 当前粘性IP已查询次数
         # 每IP稳定浏览器身份档案：一个IP一个身份（UA/Sec-Ch-Ua/语言/cookie），防跨IP共享指纹
         self._ip_fingerprints = {}
+        # IPState：每个出口独立的网络状态（request_count/health/cooldown），
+        # 替代原先单一的 self._ip_queries_used，避免不同任务共享同一计数器。
+        self._ip_states: dict = {}
 
         # === 验证码预取池（已禁用：改为每个查询独立打码） ===
         self._captcha_pool = asyncio.Queue(maxsize=10)
@@ -770,6 +814,16 @@ class beian:
         except Exception as e:
             logger.debug(f"保存封禁IP缓存失败: {e}")
 
+    def _get_ip_state(self, ipv6: str) -> IPState:
+        """按 IPv6 获取（或惰性创建）独立 IPState。"""
+        if ipv6 is None:
+            return IPState(ipv6="")
+        state = self._ip_states.get(ipv6)
+        if state is None:
+            state = IPState(ipv6=ipv6)
+            self._ip_states[ipv6] = state
+        return state
+
     async def _replace_blocked_ip(self, ip):
         """关闭被封IP的会话/指纹缓存，并从IPv6池中换一个新地址。"""
         if not ip:
@@ -803,8 +857,9 @@ class beian:
         """上游限流/拦截时：冷却当前IP并轮换粘性IP，避免单IP持续被打"""
         if ipv6:
             await self._add_blocked_ip(ipv6, cooldown=cooldown)
+            # 该 IP 进入冷却，重置其独立计数，避免复用时立刻再次轮换
+            self._get_ip_state(ipv6).request_count = 0
         self._sticky_ipv6 = None
-        self._ip_queries_used = 0
 
     def get_fingerprint(self, ip):
         """获取某IP的稳定浏览器身份档案（首次生成，之后永久复用同一身份）。
@@ -1558,13 +1613,11 @@ class beian:
             else:
                 # 批量模式：达到每IP配额后强制轮换IP（防单IP被限流/封禁）
                 if (self._batch_mode and self._sticky_ipv6 is not None
-                        and self._ip_queries_used >= self._queries_per_ip):
+                        and self._get_ip_state(self._sticky_ipv6).request_count >= self._queries_per_ip):
                     self._sticky_ipv6 = None
                     self._token_force_refresh = True
-                    self._ip_queries_used = 0
                 if self._sticky_ipv6 is None and not proxy and self.local_ipv6_addresses:
                     self._sticky_ipv6 = await self._get_ipv6_sticky()
-                    self._ip_queries_used = 0
                 ipv6 = self._sticky_ipv6
 
             if getattr(getattr(config, 'captcha', object()), 'enable', False):
@@ -1603,7 +1656,7 @@ class beian:
                         headers=base_header,
                         proxy=proxy if proxy else None) as req:
                         res = await req.text()
-                self._ip_queries_used += 1
+                self._get_ip_state(self._sticky_ipv6).request_count += 1
                 break  # 成功，退出重试循环
             else:
                 success, token, base_header = await self.get_token(proxy, ipv6=ipv6, ctx=ctx)
@@ -1632,7 +1685,7 @@ class beian:
                         json=info, headers=base_header,
                         proxy=proxy if proxy else None) as req:
                         res = await req.text()
-                    self._ip_queries_used += 1
+                    self._get_ip_state(self._sticky_ipv6).request_count += 1
 
                     if "当前访问疑似黑客攻击" in res:
                         if current_ip:
@@ -1746,13 +1799,11 @@ class beian:
         for ip_attempt in range(max_ip_retries):
             # 批量模式：达到每IP配额后强制轮换IP（防单IP被限流/封禁）
             if (self._batch_mode and self._sticky_ipv6 is not None
-                    and self._ip_queries_used >= self._queries_per_ip):
+                    and self._get_ip_state(self._sticky_ipv6).request_count >= self._queries_per_ip):
                 self._sticky_ipv6 = None
                 self._token_force_refresh = True
-                self._ip_queries_used = 0
             if self._sticky_ipv6 is None and not proxy and self.local_ipv6_addresses:
                 self._sticky_ipv6 = await self._get_ipv6_sticky()
-                self._ip_queries_used = 0
             ipv6 = self._sticky_ipv6
 
             if getattr(getattr(config, 'captcha', object()), 'enable', False):
@@ -1781,7 +1832,7 @@ class beian:
                         data=ujson.dumps(info, ensure_ascii=False),
                         headers=base_header, proxy=proxy if proxy else None) as req:
                         res = await req.text()
-                self._ip_queries_used += 1
+                self._get_ip_state(self._sticky_ipv6).request_count += 1
                 break
             else:
                 success, token, base_header = await self.get_token(proxy, ipv6=ipv6)
@@ -1806,7 +1857,7 @@ class beian:
                     async with session.post((f"{self.blackqueryByCondition}/" if sp == 0 else f"{self.blackappAndMiniByCondition}/"),
                         json=info, headers=base_header, proxy=proxy if proxy else None) as req:
                         res = await req.text()
-                    self._ip_queries_used += 1
+                    self._get_ip_state(self._sticky_ipv6).request_count += 1
 
                     if "当前访问疑似黑客攻击" in res:
                         if current_ip:
