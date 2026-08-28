@@ -369,6 +369,39 @@ class CredentialState:
         return bool(self.token) and self.token_expire > int(time.time() * 1000)
 
 
+@dataclass
+class ExecutionContext:
+    """一次真实 Query 的轻量 trace 记录（纯观测，不参与调度）。
+
+    只记录事实：哪个 domain、用了哪个 IP / Session / Credential、何时开始结束、
+    HTTP 状态、结果类型、是否成功、因重试而发出多少次 HTTP 查询。
+    不负责选择 IP、选择 Credential、retry、刷新 Token、改变调度。
+    """
+    domain: str = ""
+    ipv6: str = ""
+    credential_id: str = ""
+    token_expire: int = 0
+    start_time: float = 0.0
+    end_time: float = 0.0
+    http_status: object = None  # int HTTP status 或 "network"
+    result_type: str = ""
+    success: bool = False
+    retry_count: int = 0
+
+    @property
+    def latency_ms(self) -> float:
+        if self.end_time and self.start_time:
+            return (self.end_time - self.start_time) * 1000.0
+        return 0.0
+
+
+def _credential_stub(token: str) -> str:
+    """稳定的内部凭证标识（不打印完整 Token）。token 为空时返回 'n/a'。"""
+    if not token:
+        return "n/a"
+    return hashlib.md5(token.encode("utf-8")).hexdigest()[:8]
+
+
 class QueryContext:
     """隔离的查询上下文 - 每个IP+Token组合独立一份，支持并发安全"""
     __slots__ = ('ipv6', 'token', 'token_expire', 'token_ipv6',
@@ -403,7 +436,9 @@ class _QueryMetrics:
         "started", "completed", "attempts", "retry",
         "http_200", "http_403", "http_429", "http_5xx",
         "network_error", "latency_total_ms", "latency_max_ms",
-        "latency_samples", "per_ip"
+        "latency_samples", "traces", "per_ip", "per_cred",
+        "auth_count", "captcha_count", "active_workers",
+        "domain_total", "domain_ok", "domain_fail",
     )
 
     def __init__(self):
@@ -418,10 +453,59 @@ class _QueryMetrics:
         self.network_error = 0
         self.latency_total_ms = 0.0
         self.latency_max_ms = 0.0
-        self.latency_samples = deque(maxlen=2048)
+        self.latency_samples = deque(maxlen=4096)
+        self.traces = deque(maxlen=2048)  # 最近 2048 次查询的 ExecutionContext 快照
         self.per_ip = {}
+        self.per_cred = {}
+        self.auth_count = 0
+        self.captcha_count = 0
+        self.active_workers = 0
+        self.domain_total = 0
+        self.domain_ok = 0
+        self.domain_fail = 0
 
-    def record(self, ip, status, elapsed_ms, completed=False, retry=False):
+    def _ip_item(self, ip):
+        item = self.per_ip.get(ip)
+        if item is None:
+            item = {"n": 0, "ok": 0, "403": 0, "429": 0, "5xx": 0, "net": 0,
+                    "lat_ms": 0.0, "lat": deque(maxlen=512)}
+            self.per_ip[ip] = item
+        return item
+
+    def _cred_item(self, cid):
+        item = self.per_cred.get(cid)
+        if item is None:
+            item = {"n": 0, "ok": 0, "403": 0, "429": 0, "5xx": 0, "net": 0,
+                    "tok_err": 0, "lat_ms": 0.0, "lat": deque(maxlen=512)}
+            self.per_cred[cid] = item
+        return item
+
+    @staticmethod
+    def _bucket(status):
+        if status == 200:
+            return "ok"
+        if status == 403:
+            return "403"
+        if status == 429:
+            return "429"
+        if isinstance(status, int) and status >= 500:
+            return "5xx"
+        if status == "network":
+            return "net"
+        return None
+
+    def record(self, ip, status, elapsed_ms, completed=False, retry=False, credential_id=None):
+        _now = time.time()
+        self.traces.append(ExecutionContext(
+            ipv6=ip or "",
+            credential_id=credential_id or "",
+            start_time=_now - (elapsed_ms / 1000.0),
+            end_time=_now,
+            http_status=status,
+            result_type=self._bucket(status) or "unknown",
+            success=(status == 200),
+            retry_count=1 if retry else 0,
+        ))
         self.attempts += 1
         if retry:
             self.retry += 1
@@ -431,42 +515,111 @@ class _QueryMetrics:
             self.latency_samples.append(elapsed_ms)
         if completed:
             self.completed += 1
-        if status == 200:
+        buck = self._bucket(status)
+        if buck == "ok":
             self.http_200 += 1
-        elif status == 403:
+        elif buck == "403":
             self.http_403 += 1
-        elif status == 429:
+        elif buck == "429":
             self.http_429 += 1
-        elif isinstance(status, int) and status >= 500:
+        elif buck == "5xx":
             self.http_5xx += 1
-        elif status == "network":
+        elif buck == "net":
             self.network_error += 1
 
         if ip:
-            item = self.per_ip.setdefault(ip, {"n": 0, "ok": 0, "403": 0, "429": 0, "5xx": 0, "net": 0, "lat_ms": 0.0})
+            item = self._ip_item(ip)
             item["n"] += 1
             item["lat_ms"] += elapsed_ms
-            if status == 200:
-                item["ok"] += 1
-            elif status == 403:
-                item["403"] += 1
-            elif status == 429:
-                item["429"] += 1
-            elif isinstance(status, int) and status >= 500:
-                item["5xx"] += 1
-            elif status == "network":
-                item["net"] += 1
+            if elapsed_ms > 0:
+                item["lat"].append(elapsed_ms)
+            if buck:
+                item[buck] += 1
+
+        if credential_id:
+            c = self._cred_item(credential_id)
+            c["n"] += 1
+            c["lat_ms"] += elapsed_ms
+            if elapsed_ms > 0:
+                c["lat"].append(elapsed_ms)
+            if buck:
+                c[buck] += 1
+
+    @staticmethod
+    def _percentile(samples, p):
+        if not samples:
+            return 0.0
+        values = sorted(samples)
+        return values[min(len(values) - 1, int(len(values) * p))]
+
+    @property
+    def p50_latency_ms(self):
+        return self._percentile(self.latency_samples, 0.50)
+
+    @property
+    def p90_latency_ms(self):
+        return self._percentile(self.latency_samples, 0.90)
+
+    @property
+    def p95_latency_ms(self):
+        return self._percentile(self.latency_samples, 0.95)
+
+    @property
+    def p99_latency_ms(self):
+        return self._percentile(self.latency_samples, 0.99)
 
     @property
     def avg_latency_ms(self):
         return self.latency_total_ms / self.attempts if self.attempts else 0.0
 
-    @property
-    def p95_latency_ms(self):
-        if not self.latency_samples:
-            return 0.0
-        values = sorted(self.latency_samples)
-        return values[min(len(values) - 1, int(len(values) * 0.95))]
+    def baseline(self, elapsed, total, domain_ok, domain_fail, retry, auth, captcha, workers):
+        """输出统一性能基线（只读统计，不改变任何状态）。"""
+        attempts = self.attempts
+        completed = domain_ok
+        business_qps = completed / elapsed if elapsed > 0 else 0.0
+        http_rps = attempts / elapsed if elapsed > 0 else 0.0
+        retry_amp = attempts / max(1, completed)
+        http_403_rate = self.http_403 / attempts if attempts else 0.0
+        lines = [
+            "========== QUERY BASELINE ==========",
+            f"elapsed_sec           = {elapsed:.3f}",
+            f"total_domains         = {total}",
+            f"completed_domains     = {domain_ok}",
+            f"failed_domains        = {domain_fail}",
+            f"http_query_attempts   = {attempts}",
+            f"successful_http       = {self.http_200}",
+            f"business_qps          = {business_qps:.3f}",
+            f"http_rps              = {http_rps:.3f}",
+            f"retry_amplification   = {retry_amp:.3f}",
+            f"p50_latency_ms        = {self.p50_latency_ms:.1f}",
+            f"p90_latency_ms        = {self.p90_latency_ms:.1f}",
+            f"p95_latency_ms        = {self.p95_latency_ms:.1f}",
+            f"p99_latency_ms        = {self.p99_latency_ms:.1f}",
+            f"max_latency_ms        = {self.latency_max_ms:.1f}",
+            f"http_403              = {self.http_403}",
+            f"http_403_rate         = {http_403_rate:.3f}",
+            f"http_429              = {self.http_429}",
+            f"http_5xx              = {self.http_5xx}",
+            f"auth_count            = {auth}",
+            f"captcha_count         = {captcha}",
+            f"active_workers        = {workers}",
+        ]
+        lines.append("---- top IP ----")
+        for ip, it in sorted(self.per_ip.items(), key=lambda kv: -kv[1]["n"])[:10]:
+            ip_avg = it["lat_ms"] / it["n"] if it["n"] else 0.0
+            ip_p50 = self._percentile(it["lat"], 0.50)
+            ip_p95 = self._percentile(it["lat"], 0.95)
+            lines.append(f"  IP {ip}: req={it['n']} ok={it['ok']} "
+                         f"403={it['403']} 429={it['429']} 5xx={it['5xx']} net={it['net']} "
+                         f"avg={ip_avg:.0f}ms p50={ip_p50:.0f} p95={ip_p95:.0f}")
+        lines.append("---- top credential ----")
+        for cid, c in sorted(self.per_cred.items(), key=lambda kv: -kv[1]["n"])[:10]:
+            c_avg = c["lat_ms"] / c["n"] if c["n"] else 0.0
+            lines.append(f"  CRED {cid}: req={c['n']} ok={c['ok']} "
+                         f"403={c['403']} 429={c['429']} 5xx={c['5xx']} net={c['net']} "
+                         f"avg={c_avg:.0f}ms")
+        lines.append("====================================")
+        return "\n".join(lines)
 
 
 class _GlobalPace:
@@ -2683,7 +2836,9 @@ class beian:
                                         current_ctx.queries += 1
                                         current_ctx.last_used = _time.time()
                                         current_ctx.last_status = req.status
-                                        metrics.record(current_ip, req.status, _elapsed_ms, retry=(attempt > 0))
+                                        metrics.record(current_ip, req.status, _elapsed_ms,
+                                                       retry=(attempt > 0),
+                                                       credential_id=_credential_stub(current_cred["token"]))
                                         stats['http_attempts'] += 1
                                         stats['latency_ms'] += _elapsed_ms
                                         stats['latency_max_ms'] = max(stats['latency_max_ms'], _elapsed_ms)
@@ -2742,7 +2897,9 @@ class beian:
                                     continue
                                 return (idx, domain, False, "network_error")
                             except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
-                                metrics.record(current_ip, "network", 0.0, retry=(attempt > 0))
+                                metrics.record(current_ip, "network", 0.0,
+                                               retry=(attempt > 0),
+                                               credential_id=_credential_stub(current_cred["token"]))
                                 if attempt < 2:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.3 * (attempt + 1))
@@ -2836,7 +2993,9 @@ class beian:
                                         timeout=aiohttp.ClientTimeout(total=5)
                                     ) as req:
                                         _elapsed_ms = (_time.perf_counter() - _req_t0) * 1000.0
-                                        metrics.record(p_ip, req.status, _elapsed_ms, retry=(attempt > 0))
+                                        metrics.record(p_ip, req.status, _elapsed_ms,
+                                                       retry=(attempt > 0),
+                                                       credential_id=_credential_stub(p_cred["token"]))
                                         stats['http_attempts'] += 1
                                         stats['latency_ms'] += _elapsed_ms
                                         stats['latency_max_ms'] = max(stats['latency_max_ms'], _elapsed_ms)
@@ -3224,6 +3383,18 @@ class beian:
                 f"打码{stats['tokens']}次, 耗时{elapsed:.1f}s, 业务速度{qps:.1f}q/s ≈ {qph:.0f}QPH, "
                 f"session_hit={getattr(self, '_session_pool_hits', 0)} session_miss={getattr(self, '_session_pool_misses', 0)}"
             )
+            # 统一性能基线（纯观测，不改变调度/请求）
+            try:
+                _base_line = metrics.baseline(
+                    elapsed, total,
+                    domain_ok=stats['ok'], domain_fail=total - stats['ok'],
+                    retry=stats['retry'],
+                    auth=stats.get('auth', 0), captcha=stats.get('tokens', 0),
+                    workers=max_workers,
+                )
+                logger.info(_base_line)
+            except Exception as _e:
+                logger.debug(f"base line 输出异常: {_e}")
         except Exception as e:
             logger.error(f"💥 stream_query异常: {e}\n{traceback.format_exc()}")
         
