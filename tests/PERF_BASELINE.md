@@ -62,3 +62,35 @@ EQR                ≈ 0.785
 > 注意：`0.6s` 是**当前测试环境、当前访问方式、当前配置、5000 条样本下资源效率更高的稳定工作点**，
 > 不是“官方允许的固定安全上限”。若要突破到 30–50 business_qps，需依赖官方更高吞吐的调用方式
 > （批量接口 / 提高配额 / 授权 API），而非继续在 WAF 行为上做规避式调度。
+
+## R1：运行期 IP 候选源动态化（`fix(ip-pool)`）
+
+R1 解决的是任务运行期间静态 `exit_slots` 与动态 IPv6 Pool 脱节的问题。
+
+### 背景
+
+原实现中 `stream_query` 在任务启动时用
+
+```python
+exit_slots = list(local_ipv6_addresses)
+```
+
+一次性冻结出口集合。池替换/补位进来的新 IPv6 即使进入 `active_addresses`，worker
+也看不到；而被 1800s hard-block 的旧 IP 仍占着候选槽、被 `_is_ip_blocked` 挡在调度之外。
+于是长任务健康执行资源逐渐下降，最终 pool exhaustion。
+
+### 改动
+
+- 新增 `_live_ip_members()`：worker 每次选择 IP 时从当前 `local_ipv6_addresses`
+  （含隧道槽位）实时重建候选集合，不再使用任务启动时的静态快照。
+- worker 的巡检（全池是否被封）、轮换候选、轮换尝试上限、后台预取候选全部改为
+  使用实时候选源。
+- 保持 B1 公平调度算法不变（负载最低 / 未封 / 未独占），只替换 candidate source。
+- 不修改 worker 数量、`ip_query_interval`、Credential / Token / CAPTCHA、retry、
+  requeue、WAF cooldown、replacement concurrency / backoff。
+
+### 吞吐边界说明（谨慎表述）
+
+当前实验显示，在现有公网查询方式、配置和测试环境下，稳定业务吞吐约为 20–21/s；
+更高并发会导致明显的 403/重试恶化。长任务实验还观察到 auth 通道持续受到上游拦截，
+因此长期吞吐边界仍需区分客户端资源生命周期因素与上游服务侧限制。

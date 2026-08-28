@@ -2315,6 +2315,17 @@ class beian:
         total_ips = len(exit_slots)
         if total_ips == 0:
             return [(d, False, "无可用出口") for d in domains]
+
+        # ── 动态候选源：worker 每次需要选 IP 时都应从当前 live 集合重建，而
+        #    不是用任务启动时的静态快照（exit_slots）。池替换/补位进来的新 IP
+        #    会通过 refresh_ipv6_addresses 更新 local_ipv6_addresses，这里实时
+        #    读取它即可让新 IP 被正在运行的任务发现，无需重启任务。
+        #    保持 B1 公平调度算法不变，只替换 candidate source。
+        def _live_ip_members():
+            if tunnel_mode:
+                return ([f"tunnel-{i}" for i in range(self._tunnel_batch_slots)]
+                        + list(self.local_ipv6_addresses))
+            return list(self.local_ipv6_addresses)
         
         # 🔥 回退并发模型 (2026-08-01 v3):
         #   实测: 串行=极慢+创宇盾照样封 → 封IP与并发无关, 是阈值触发
@@ -2605,7 +2616,9 @@ class beian:
                 empty_rounds = 0
                 candidates = []
                 seen = set()
-                for ip in list(available_ips) + list(exit_slots):
+                # 用实时候选源，让池替换/补位新 IP 也能被预取到 token（否则新 IP
+                # 即使进了候选集也要现场打码，造成 auth 等待）。
+                for ip in _live_ip_members():
                     if ip in seen:
                         continue
                     seen.add(ip)
@@ -2766,8 +2779,8 @@ class beian:
                         except asyncio.QueueEmpty:
                             break
                     
-                    # ── 检查IP池是否全被封 ──
-                    if not any([not await self._is_ip_blocked(a) for a in exit_slots]):
+                    # ── 检查IP池是否全被封（用实时候选，因为池替换会动态增删成员）──
+                    if not any([not await self._is_ip_blocked(a) for a in _live_ip_members()]):
                         shared_blocked_waits += 1
                         wait = min(30 * shared_blocked_waits, 120)  # 30s起，上限2分钟
                         logger.warning(f"⏳ W{worker_id}: 所有IP被封，等待{wait}s（第{shared_blocked_waits}次/60）")
@@ -2781,7 +2794,7 @@ class beian:
                             # 2s细粒度轮询：IP恢复后可立即复工，避免固定10s空等
                             await asyncio.sleep(min(2, deadline - _time.monotonic()))
                             if any([not await self._is_ip_blocked(a)
-                                    for a in exit_slots]):
+                                    for a in _live_ip_members()]):
                                 break
                         # 把已取出但未处理的域名放回队列，等IP恢复后再试
                         for idx, domain in reversed(batch_items):
@@ -2796,7 +2809,9 @@ class beian:
                         nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, token_used, rotation_cap, ip_idx, ip_switch_count, auth_fail_streak
                         if getattr(self, "_auth_global_cooldown_until", 0.0) > _time.monotonic():
                             return False
-                        for _ in range(max(len(ip_slice), len(exit_slots)) * 2):
+                        # 用实时候选规模作为轮换尝试上限，避免静态 exit_slots 低估/高估
+                        _live_size = max(len(_live_ip_members()), len(ip_slice))
+                        for _ in range(max(len(ip_slice), _live_size) * 2):
                             now_ms = int(_time.time() * 1000)
                             if (current_ip is not None and current_ctx is not None
                                     and current_cred is not None
@@ -2825,11 +2840,12 @@ class beian:
                                 current_cred = None
                                 queries_on_ip = 0
                                 token_used = 0
-                            # 轮转找下一个未封IP：先用本worker分片，再补充池中新地址
-                            # （封禁替换会动态新增IP，静态分片看不到新地址会再次卡死）
+                            # 轮转找下一个未封IP：先用本worker分片（保持B1公平起步），
+                            # 再补充当前 live 集合（池替换/补位动态新增的 IP 也能被看到，
+                            # 避免静态 exit_slots 快照导致新 IP 永远进不了候选集）。
                             candidates = list(ip_slice)
                             seen = set(candidates)
-                            for _ip in exit_slots:
+                            for _ip in _live_ip_members():
                                 if _ip not in seen:
                                     candidates.append(_ip)
                                     seen.add(_ip)
