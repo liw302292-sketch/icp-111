@@ -6,7 +6,7 @@ system:
   detail_concurrency: 10
   batch_workers: 24  # 回到验证过的稳定档；加并发会让新/64的403被放大
   ip_query_concurrency: 1  # 每IP串行，避免挑战页被并发触发
-  ip_query_interval: 0.5  # 每IP间隔，稳定档
+  ip_query_interval: 0.6  # 每IP间隔，性能基线定档（0.5~0.6 为最优，0.6 资源效率更高）
   token_query_cap: 60  # 每个IP独立token窗口内最多查询条数
   ip_queries_per_rotation: 15  # 同一IP在窗口内连续查询条数后轮换IP
   max_requeue_attempts: 3  # 单个域名被限流后的最大延迟重试次数（降低重试风暴）
