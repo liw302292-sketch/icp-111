@@ -26,6 +26,7 @@ from load_config import config
 from cachetools import TTLCache
 from utils import get_project_root
 from dataclasses import dataclass, field
+import perf_monitor
 
 ssl._create_default_https_context = ssl._create_unverified_context()
 
@@ -693,6 +694,62 @@ class _QueryMetrics:
         lines.append(f"effective_query_ratio = {_eqr:.3f}")
         lines.append("====================================")
         return "\n".join(lines)
+
+    def summary_dict(self, elapsed, total, domain_ok, domain_fail, retry, auth, captcha, workers):
+        """返回机器可读的性能指标字典（口径与 baseline() 完全一致，纯统计）。"""
+        attempts = self.attempts
+        completed = domain_ok
+        business_qps = completed / elapsed if elapsed > 0 else 0.0
+        http_rps = attempts / elapsed if elapsed > 0 else 0.0
+        retry_amp = attempts / max(1, completed)
+        http_403_rate = self.http_403 / attempts if attempts else 0.0
+        eqr = self.http_200 / attempts if attempts else 0.0
+        denom = max(1, completed)
+        sp = {
+            "elapsed_sec": elapsed,
+            "total_domains": total,
+            "completed_domains": domain_ok,
+            "failed_domains": domain_fail,
+            "http_query_attempts": attempts,
+            "successful_http": self.http_200,
+            "business_qps": business_qps,
+            "http_rps": http_rps,
+            "retry_amplification": retry_amp,
+            "effective_query_ratio": eqr,
+            "http_403": self.http_403,
+            "http_403_rate": http_403_rate,
+            "captcha_count": captcha,
+            "captcha_per_1000_domains": captcha / denom * 1000.0,
+            "domains_per_captcha": completed / captcha if captcha else 0.0,
+            "unique_ipv6": len(self.per_ip),
+            "ipv6_per_1000_domains": len(self.per_ip) / denom * 1000.0,
+            "domains_per_ipv6": completed / len(self.per_ip) if self.per_ip else 0.0,
+            "unique_credentials": len(self.per_cred),
+            "domains_per_credential": completed / len(self.per_cred) if self.per_cred else 0.0,
+            "avg_queries_per_credential": (
+                sum(c["n"] for c in self.per_cred.values()) / len(self.per_cred)
+                if self.per_cred else 0.0),
+            "p50_latency_ms": self.p50_latency_ms,
+            "p90_latency_ms": self.p90_latency_ms,
+            "p95_latency_ms": self.p95_latency_ms,
+            "p99_latency_ms": self.p99_latency_ms,
+            "max_latency_ms": self.latency_max_ms,
+            "http_429": self.http_429,
+            "http_5xx": self.http_5xx,
+            "auth_count": auth,
+            "active_workers": workers,
+            "active_ip": len(self.per_ip),
+            "active_credentials": len(self.per_cred),
+        }
+        # IP 负载偏斜：CV = std(request_count) / mean(request_count)
+        if self.per_ip:
+            reqs = [it["n"] for it in self.per_ip.values()]
+            mean = sum(reqs) / len(reqs)
+            var = sum((r - mean) ** 2 for r in reqs) / len(reqs)
+            sp["ip_load_cv"] = (var ** 0.5) / mean if mean else 0.0
+        else:
+            sp["ip_load_cv"] = 0.0
+        return sp
 
 
 class _GlobalPace:
@@ -2581,8 +2638,34 @@ class beian:
         prefetch_tasks = [asyncio.ensure_future(prefetch_one(ip))
                           for ip in _tunnel_first(available_ips)[:prefetch_count]]
         
+        last_live = [0.0]
+
+        def _live_report():
+            """每60秒输出一次窗口实时指标（纯观测，不改变调度）。"""
+            now = _time.monotonic()
+            if now - last_live[0] < 60:
+                return
+            last_live[0] = now
+            elapsed = _time.time() - t_start
+            completed = stats['ok']
+            attempts = stats['http_attempts']
+            if attempts < 1:
+                return
+            logger.info(perf_monitor.format_live(
+                elapsed, completed,
+                completed / elapsed if elapsed else 0.0,
+                attempts / elapsed if elapsed else 0.0,
+                stats.get('http_403', 0) / attempts,
+                attempts / max(1, completed),
+                stats.get('http_200', 0) / attempts,
+                stats.get('tokens', 0) / max(1, completed) * 1000.0,
+                len(metrics.per_ip) / max(1, completed) * 1000.0,
+                max_workers, len(metrics.per_ip), len(metrics.per_cred),
+            ))
+
         async def safe_update_progress():
-            """安全调用进度回调（含已备案数实时推送）"""
+            """安全调用进度回调（含已备案数实时推送）+ 每60秒输出实时窗口指标。"""
+            _live_report()
             if progress_cb is None:
                 return
             done = stats['ok'] + stats['fail']
@@ -3513,6 +3596,22 @@ class beian:
                     workers=max_workers,
                 )
                 logger.info(_base_line)
+                # 生产化：自动基线比较 + 三级告警（纯观测，不改行为）
+                try:
+                    _perf_on = bool(getattr(
+                        getattr(config, 'system', object()), 'enable_perf_compare', True))
+                    if _perf_on and not bool(getattr(
+                            getattr(config, 'system', object()), 'no_perf_baseline', False)):
+                        _summary = metrics.summary_dict(
+                            elapsed, total, stats['ok'], total - stats['ok'],
+                            stats['retry'], stats.get('auth', 0),
+                            stats.get('tokens', 0), max_workers)
+                        _base = perf_monitor.load_baseline()
+                        if _base:
+                            _plevel, _ptext, _palerts = perf_monitor.evaluate(_summary, _base)
+                            logger.info(_ptext)
+                except Exception as _e:
+                    logger.debug(f"perf compare 输出异常: {_e}")
             except Exception as _e:
                 logger.debug(f"base line 输出异常: {_e}")
         except Exception as e:

@@ -1,0 +1,13 @@
+{
+  "seed": 12345,
+  "domains": 5000,
+  "workers": 24,
+  "ip_query_interval": 0.6,
+  "business_qps": {"baseline": 20.34},
+  "effective_query_ratio": {"baseline": 0.785},
+  "captcha_per_1000_domains": {"baseline": 43.4},
+  "ipv6_per_1000_domains": {"baseline": 42.2},
+  "retry_amplification": {"baseline": 1.27},
+  "http_403_rate": {"baseline": 0.21},
+  "domains_per_credential": {"baseline": 21.0}
+}
