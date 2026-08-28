@@ -2366,6 +2366,7 @@ class beian:
                  'http_attempts': 0, 'http_200': 0, 'http_403': 0, 'http_429': 0,
                  'http_5xx': 0, 'latency_ms': 0.0, 'latency_max_ms': 0.0}
         metrics = _QueryMetrics()
+        rm = perf_monitor.RetryMetrics()  # 403→同IP重试 / requeue 域名级生命周期（纯观测）
         stats_lock = asyncio.Lock()
         # 跨worker共享的连续失败计数：避免尾部多worker各自重试、反复空转
         shared_blocked_waits = 0
@@ -3004,6 +3005,11 @@ class beian:
                     async def query_one_with_retry(idx, domain):
                         """单条查询：403/HTML同IP短重试；硬429才拉黑IP并换IP。"""
                         nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, token_used, rotation_cap, ip_idx, ip_switch_count
+
+                        def _consume_403_retry(success, latency_ms=0.0):
+                            """403→同IP重试的最终结果（按 domain_id 排他，纯计数）。"""
+                            rm.finish_403_retry(idx, success, latency_ms)
+
                         if shared_mode and not await self._shared_try_consume(idx):
                             self._shared_invalidate()
                             return (idx, domain, False, "shared_cap")
@@ -3015,6 +3021,7 @@ class beian:
                         last_reason = "max_retries"
                         for attempt in range(4):
                             if not await ensure_ip_ready():
+                                _consume_403_retry(False, 0.0)
                                 return (idx, domain, False, "ip_pool_exhausted")
                             queries_on_ip += 1
                             token_used += 1
@@ -3059,6 +3066,7 @@ class beian:
                                         except Exception:
                                             pass
                                         if req.status == 429:
+                                            _consume_403_retry(False, _elapsed_ms)
                                             drop_token(current_ip)
                                             if rotation_cap > 6:
                                                 rotation_cap = max(6, rotation_cap - 5)
@@ -3072,18 +3080,22 @@ class beian:
                                             # 同IP等0.4秒重试（保留token），4次仍失败才交给延迟重试。
                                             last_reason = "ip_403_streak"
                                             if attempt < 1:
+                                                rm.start_403_retry(idx)
                                                 await asyncio.sleep(0.4)
                                                 continue
+                                            _consume_403_retry(False, _elapsed_ms)
                                             await cache_token(current_ip, current_ctx, current_cred,
                                                                current_headers, token_used)
                                             return (idx, domain, False, "ip_403_streak")
                                         if req.status in (502, 503, 504):
+                                            _consume_403_retry(False, _elapsed_ms)
                                             if attempt < 3:
                                                 stats['retry'] += 1
                                                 await asyncio.sleep(0.5)
                                                 continue
                                             return (idx, domain, False, f"HTTP_{req.status}")
                                         if req.status != 200:
+                                            _consume_403_retry(False, _elapsed_ms)
                                             return (idx, domain, False, f"HTTP_{req.status}")
                                         res_text = await req.text()
                             except asyncio.CancelledError:
@@ -3092,6 +3104,7 @@ class beian:
                                 _t = asyncio.current_task()
                                 if _t is not None and _t.cancelling() > 0:
                                     raise
+                                _consume_403_retry(False, 0.0)
                                 if attempt < 3:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.3)
@@ -3102,6 +3115,7 @@ class beian:
                                                retry=(attempt > 0),
                                                credential_id=_credential_stub(current_cred["token"]))
                                 self._note_ip_result(current_ip, "network")
+                                _consume_403_retry(False, 0.0)
                                 if attempt < 2:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.3 * (attempt + 1))
@@ -3109,6 +3123,7 @@ class beian:
                                 await self._mark_ip_unreachable(current_ip)
                                 return (idx, domain, False, "network_error")
                             except Exception as e:
+                                _consume_403_retry(False, 0.0)
                                 return (idx, domain, False, str(e)[:80])
 
                             try:
@@ -3116,6 +3131,7 @@ class beian:
                             except Exception:
                                 # 非JSON（HTML挑战页）：同上，最多5次机会，再失败换IP
                                 last_reason = "ip_403_streak"
+                                _consume_403_retry(False, _elapsed_ms)
                                 if attempt < 3:
                                     continue
                                 await cache_token(current_ip, current_ctx, current_cred,
@@ -3125,6 +3141,7 @@ class beian:
                             if data.get("code") in (500, 502, 503, 504):
                                 # 上游瞬时错误：短重试，仍失败则延迟重查
                                 last_reason = f"HTTP_{data.get('code')}"
+                                _consume_403_retry(False, _elapsed_ms)
                                 if attempt < 3:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.5)
@@ -3132,6 +3149,7 @@ class beian:
                                 return (idx, domain, False, last_reason)
                             if data.get("code") == 429:
                                 # 应用层限流：该IP拉黑1800s，换IP重查
+                                _consume_403_retry(False, _elapsed_ms)
                                 drop_token(current_ip)
                                 if rotation_cap > 6:
                                     rotation_cap = max(6, rotation_cap - 5)
@@ -3144,6 +3162,7 @@ class beian:
                                     k in str(data.get("msg") or data.get("message") or "")
                                     for k in ("token", "uuid", "非法", "失效")):
                                 # token失效：刷新当前IP的token后重试
+                                _consume_403_retry(False, _elapsed_ms)
                                 if shared_mode:
                                     self._shared_invalidate()
                                 drop_token(current_ip)
@@ -3155,8 +3174,11 @@ class beian:
                                     continue
                                 return (idx, domain, False, "token_invalid")
                             if data.get('success', False) or data.get('code') == 200:
+                                _consume_403_retry(True, _elapsed_ms)
                                 return (idx, domain, True, data)
+                            _consume_403_retry(False, _elapsed_ms)
                             return (idx, domain, False, data)
+                        _consume_403_retry(False, 0.0)
                         return (idx, domain, False, last_reason)
 
                     async def query_one_parallel(idx, domain):
@@ -3409,6 +3431,7 @@ class beian:
                             rc = requeue_tracker.get(idx, 0)
                             if rc < MAX_REQUEUE_ATTEMPTS:
                                 requeue_tracker[idx] = rc + 1
+                                rm.on_requeue(idx)
                                 requeue_count += 1
                                 kind = "429" if result == "ip_429" else (
                                     "403" if result in ("ip_403_streak", "shared_cap") else "net")
@@ -3423,6 +3446,7 @@ class beian:
                                     results[idx] = (domain, False, "requeue_exhausted")
                                 except Exception:
                                     pass
+                                rm.on_final(idx, False)
                                 async with stats_lock:
                                     stats['fail'] += 1
                                     stats['net_err'] += 1
@@ -3439,6 +3463,8 @@ class beian:
                             results[idx] = (domain, success, result)
                         except Exception:
                             results[idx] = (domain, False, f"result_err:{str(result)[:40]}")
+                            success = False
+                        rm.on_final(idx, bool(success))
                         
                         # 更新统计
                         async with stats_lock:
@@ -3559,6 +3585,7 @@ class beian:
                     _, _, idx, domain = retry_heap.get_nowait()
                     if results[idx] is None:
                         results[idx] = (domain, False, "requeue_exhausted")
+                        rm.on_final(idx, False)
                         stats['fail'] += 1
                         retry_left += 1
                         if on_result_cb is not None:
@@ -3610,6 +3637,7 @@ class beian:
                         if _base:
                             _plevel, _ptext, _palerts = perf_monitor.evaluate(_summary, _base)
                             logger.info(_ptext)
+                    logger.info(rm.format())
                 except Exception as _e:
                     logger.debug(f"perf compare 输出异常: {_e}")
             except Exception as _e:

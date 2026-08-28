@@ -264,3 +264,92 @@ def format_live(elapsed, completed, business_qps, http_rps, rate_403, retry_amp,
         f"active_credentials = {active_cred}\n"
         "=================================="
     )
+
+
+class RetryMetrics:
+    """403→同IP重试 与 requeue 的域名级生命周期统计（纯计数，不改行为）。"""
+
+    def __init__(self):
+        self.retry_403_count = 0
+        self.retry_403_success = 0
+        self.retry_403_fail = 0
+        self._pending = set()  # 按 domain_id 记录当前处于 403→同IP重试 的域名
+        self.requeue_events = 0
+        self.requeue_domains = set()
+        self.requeue_success_domains = 0
+        self.requeue_failed_domains = 0
+        self.succ_no_req = 0
+        self.succ_after_req = 0
+        self.fail_no_req = 0
+        self.fail_after_req = 0
+        self.same_ip_retry_lat = []
+
+    def start_403_retry(self, domain_id):
+        self.retry_403_count += 1
+        self._pending.add(domain_id)
+
+    def finish_403_retry(self, domain_id, success, latency_ms=0.0):
+        if domain_id in self._pending:
+            self._pending.discard(domain_id)
+            if success:
+                self.retry_403_success += 1
+            else:
+                self.retry_403_fail += 1
+            if latency_ms > 0:
+                self.same_ip_retry_lat.append(latency_ms)
+
+    def on_requeue(self, domain_id):
+        self.requeue_events += 1
+        self.requeue_domains.add(domain_id)
+
+    def on_final(self, domain_id, success):
+        has_req = domain_id in self.requeue_domains
+        if success:
+            if has_req:
+                self.succ_after_req += 1
+                self.requeue_success_domains += 1
+            else:
+                self.succ_no_req += 1
+        else:
+            if has_req:
+                self.fail_after_req += 1
+                self.requeue_failed_domains += 1
+            else:
+                self.fail_no_req += 1
+
+    @property
+    def retry_403_conversion(self):
+        return self.retry_403_success / self.retry_403_count if self.retry_403_count else 0.0
+
+    @property
+    def requeue_conversion(self):
+        return (self.requeue_success_domains / len(self.requeue_domains)
+                if self.requeue_domains else 0.0)
+
+    def p50_p95_retry_lat(self):
+        if not self.same_ip_retry_lat:
+            return 0.0, 0.0
+        s = sorted(self.same_ip_retry_lat)
+        return s[min(len(s) - 1, int(len(s) * 0.50))], s[min(len(s) - 1, int(len(s) * 0.95))]
+
+    def format(self):
+        p50, p95 = self.p50_p95_retry_lat()
+        return (
+            "========== RETRY CONVERSION ==========\n"
+            f"403_retry_count              = {self.retry_403_count}\n"
+            f"403_retry_success            = {self.retry_403_success}\n"
+            f"403_retry_fail               = {self.retry_403_fail}\n"
+            f"403_retry_conversion_rate    = {self.retry_403_conversion:.3f}\n"
+            f"same_ip_retry_p50            = {p50:.1f}ms\n"
+            f"same_ip_retry_p95            = {p95:.1f}ms\n"
+            f"requeue_domain_count         = {len(self.requeue_domains)}\n"
+            f"requeue_event_count          = {self.requeue_events}\n"
+            f"requeue_success_domains      = {self.requeue_success_domains}\n"
+            f"requeue_failed_domains       = {self.requeue_failed_domains}\n"
+            f"requeue_conversion_rate      = {self.requeue_conversion:.3f}\n"
+            f"SUCCESS_NO_REQUEUE           = {self.succ_no_req}\n"
+            f"SUCCESS_AFTER_REQUEUE        = {self.succ_after_req}\n"
+            f"FAILED_AFTER_REQUEUE         = {self.fail_after_req}\n"
+            f"FAILED_NO_REQUEUE            = {self.fail_no_req}\n"
+            "=======================================\n"
+        )
