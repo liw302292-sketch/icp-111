@@ -684,10 +684,13 @@ class _QueryMetrics:
             lines.append(f"abandoned_before_cap = {_prem}")
         lines.append("---- RESOURCE EFFICIENCY ----")
         _denom = max(1, completed)
+        _eqr = self.http_200 / attempts if attempts else 0.0
         lines.append(f"domains_per_captcha = {completed / captcha if captcha else 0.0:.2f}")
         lines.append(f"domains_per_ipv6 = {completed / len(self.per_ip) if self.per_ip else 0.0:.2f}")
         lines.append(f"captcha_per_1000_domains = {captcha / _denom * 1000.0:.1f}")
         lines.append(f"ipv6_per_1000_domains = {len(self.per_ip) / _denom * 1000.0:.1f}")
+        # 有效请求比例：每发出 100 次 HTTP Query，真正变成有效业务结果的比例。
+        lines.append(f"effective_query_ratio = {_eqr:.3f}")
         lines.append("====================================")
         return "\n".join(lines)
 
