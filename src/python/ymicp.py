@@ -335,15 +335,30 @@ class IPState:
     """
     ipv6: str
     request_count: int = 0
+    success_count: int = 0
+    network_error_count: int = 0
     consecutive_failures: int = 0
     consecutive_403: int = 0
     last_success: float = 0.0
+    last_request_time: float = 0.0
     cooldown_until: float = 0.0
     health: str = "unknown"
 
     @property
     def healthy(self) -> bool:
         return self.health not in ("cooldown", "unreachable", "bad")
+
+    @property
+    def load(self) -> int:
+        return self.request_count
+
+    @property
+    def request_403_count(self) -> int:
+        return self.consecutive_403
+
+    @property
+    def request_403_rate(self) -> float:
+        return self.consecutive_403 / self.request_count if self.request_count else 0.0
 
 
 @dataclass
@@ -604,19 +619,49 @@ class _QueryMetrics:
             f"captcha_count         = {captcha}",
             f"active_workers        = {workers}",
         ]
-        lines.append("---- top IP ----")
-        for ip, it in sorted(self.per_ip.items(), key=lambda kv: -kv[1]["n"])[:10]:
+        # ── IP / 403 分布（判断负载是否均匀）──
+        def _median(v):
+            if not v:
+                return 0.0
+            s = sorted(v)
+            return s[len(s) // 2] if len(s) % 2 else (s[len(s)//2 - 1] + s[len(s)//2]) / 2.0
+
+        if self.per_ip:
+            reqs = [it["n"] for it in self.per_ip.values()]
+            rates403 = [it["403"] / it["n"] if it["n"] else 0.0 for it in self.per_ip.values()]
+            _mean = sum(reqs) / len(reqs)
+            _var = sum((r - _mean) ** 2 for r in reqs) / len(reqs)
+            _stdev = _var ** 0.5
+            _cv = _stdev / _mean if _mean else 0.0
+            lines.append("---- IP LOAD DISTRIBUTION ----")
+            lines.append(f"total_ip = {len(self.per_ip)}")
+            lines.append(f"mean_requests = {_mean:.2f}")
+            lines.append(f"median_requests = {_median(reqs):.2f}")
+            lines.append(f"p90_requests = {self._percentile(reqs, 0.90):.2f}")
+            lines.append(f"p95_requests = {self._percentile(reqs, 0.95):.2f}")
+            lines.append(f"max_requests = {max(reqs)}")
+            lines.append(f"coefficient_of_variation = {_cv:.3f}")
+            lines.append("---- 403 DISTRIBUTION (per IP) ----")
+            lines.append(f"mean_ip_403_rate = {sum(rates403)/len(rates403):.3f}")
+            lines.append(f"median_ip_403_rate = {_median(rates403):.3f}")
+            lines.append(f"p90_ip_403_rate = {self._percentile(rates403, 0.90):.3f}")
+            lines.append(f"max_ip_403_rate = {max(rates403):.3f}")
+
+        lines.append("---- P(403 | IP) top ----")
+        for ip, it in sorted(self.per_ip.items(), key=lambda kv: -kv[1]["403"])[:10]:
             ip_avg = it["lat_ms"] / it["n"] if it["n"] else 0.0
             ip_p50 = self._percentile(it["lat"], 0.50)
             ip_p95 = self._percentile(it["lat"], 0.95)
+            rate = it["403"] / it["n"] if it["n"] else 0.0
             lines.append(f"  IP {ip}: req={it['n']} ok={it['ok']} "
-                         f"403={it['403']} 429={it['429']} 5xx={it['5xx']} net={it['net']} "
+                         f"403={it['403']}(rate={rate:.2f}) 429={it['429']} 5xx={it['5xx']} net={it['net']} "
                          f"avg={ip_avg:.0f}ms p50={ip_p50:.0f} p95={ip_p95:.0f}")
-        lines.append("---- top credential ----")
-        for cid, c in sorted(self.per_cred.items(), key=lambda kv: -kv[1]["n"])[:10]:
+        lines.append("---- P(403 | Credential) top ----")
+        for cid, c in sorted(self.per_cred.items(), key=lambda kv: -kv[1]["403"])[:10]:
             c_avg = c["lat_ms"] / c["n"] if c["n"] else 0.0
+            rate = c["403"] / c["n"] if c["n"] else 0.0
             lines.append(f"  CRED {cid}: req={c['n']} ok={c['ok']} "
-                         f"403={c['403']} 429={c['429']} 5xx={c['5xx']} net={c['net']} "
+                         f"403={c['403']}(rate={rate:.2f}) 429={c['429']} 5xx={c['5xx']} net={c['net']} "
                          f"avg={c_avg:.0f}ms")
         lines.append("====================================")
         return "\n".join(lines)
@@ -872,10 +917,32 @@ class beian:
         """按 IPv6 获取（或惰性创建）独立 IPState。"""
         if ipv6 is None:
             return IPState(ipv6="")
-        state = self._ip_states.get(ipv6)
+        states = getattr(self, "_ip_states", None)
+        if states is None:
+            states = {}
+            self._ip_states = states
+        state = states.get(ipv6)
         if state is None:
             state = IPState(ipv6=ipv6)
-            self._ip_states[ipv6] = state
+            states[ipv6] = state
+        return state
+
+    def _note_ip_result(self, ipv6: str, status: object) -> IPState:
+        """记录一次 HTTP 查询结果到对应 IPState（纯统计，不改变调度/风控）。"""
+        if not ipv6:
+            return IPState(ipv6="")
+        state = self._get_ip_state(ipv6)
+        state.request_count += 1
+        state.last_request_time = time.time()
+        if status == 200:
+            state.success_count += 1
+            state.last_success = time.time()
+        elif status == 403:
+            state.consecutive_403 += 1
+            state.consecutive_failures += 1
+        elif status == "network" or (isinstance(status, int) and status >= 500):
+            state.network_error_count += 1
+            state.consecutive_failures += 1
         return state
 
     async def _replace_blocked_ip(self, ip):
@@ -2656,8 +2723,10 @@ class beian:
                                     seen.add(_ip)
 
                             # 🔥 优先复用缓存token的IP：避免每波都重新取号（取号是auth瓶颈）。
-                            # worker在自留IP里反复循环，绝大部分查询走缓存token，零取号等待。
+                            # 公平调度：在“有缓存token且未被封”的可用IP里，选负载最低的，
+                            # 而不是第一个，避免少数热点IP被反复压。仍优先缓存token，不改token生命周期。
                             cached_ip = None
+                            best_cached_load = None
                             for cand in candidates:
                                 if await self._is_ip_blocked(cand):
                                     continue
@@ -2671,9 +2740,13 @@ class beian:
                                 if _c_ctx.token_expire <= int(_time.time() * 1000):
                                     ip_token_cache.pop(cand, None)
                                     continue
-                                if await claim_ip(cand):
+                                _load = self._get_ip_state(cand).request_count
+                                if cached_ip is None or _load < best_cached_load:
                                     cached_ip = cand
-                                    break
+                                    best_cached_load = _load
+                            if cached_ip is not None and not await claim_ip(cached_ip):
+                                # 被其他 worker 抢走：放弃本轮缓存，走下方 fresh 路径
+                                cached_ip = None
                             if cached_ip is not None:
                                 current_ip = cached_ip
                                 _c_ctx, _c_cred, _c_hd, _c_used = ip_token_cache.pop(cached_ip)
@@ -2683,7 +2756,7 @@ class beian:
                                 queries_on_ip = 0
                                 token_used = _c_used
                                 auth_fail_streak = 0
-                                logger.info(f"♻️ W{worker_id} 优先复用缓存Token (IP={current_ip[-12:]}, 已用{_c_used})")
+                                logger.info(f"♻️ W{worker_id} 复用缓存Token (IP={current_ip[-12:]}, 已用{_c_used})")
                                 return True
 
                             # 缓存token用尽后才取预取token（预取=新打码，优先级低于复用）
@@ -2703,15 +2776,31 @@ class beian:
                                     return True
                                 await release_ip(p_ip)
 
+                            # 公平调度：选“当前负载最低且可用（未封/未独占）”的IP；
+                            # 若被其他 worker 抢走则退回旧轮询兜底，避免空转。
                             next_ip = None
-                            for _ in range(len(candidates)):
-                                ip_idx = (ip_idx + 1) % len(candidates)
-                                cand = candidates[ip_idx]
+                            best_load = None
+                            for cand in candidates:
                                 if await self._is_ip_blocked(cand):
                                     continue
-                                if await claim_ip(cand):
+                                if cand in claimed_ips:
+                                    continue
+                                _load = self._get_ip_state(cand).request_count
+                                if next_ip is None or _load < best_load:
                                     next_ip = cand
-                                    break
+                                    best_load = _load
+                            if next_ip is not None and not await claim_ip(next_ip):
+                                # 被其他 worker 抢走：退回旧轮询兜底
+                                next_ip = None
+                            if next_ip is None:
+                                for _ in range(len(candidates)):
+                                    ip_idx = (ip_idx + 1) % len(candidates)
+                                    cand = candidates[ip_idx]
+                                    if await self._is_ip_blocked(cand):
+                                        continue
+                                    if await claim_ip(cand):
+                                        next_ip = cand
+                                        break
                             if next_ip is None:
                                 current_ip = None
                                 current_ctx = None
@@ -2839,6 +2928,7 @@ class beian:
                                         metrics.record(current_ip, req.status, _elapsed_ms,
                                                        retry=(attempt > 0),
                                                        credential_id=_credential_stub(current_cred["token"]))
+                                        self._note_ip_result(current_ip, req.status)
                                         stats['http_attempts'] += 1
                                         stats['latency_ms'] += _elapsed_ms
                                         stats['latency_max_ms'] = max(stats['latency_max_ms'], _elapsed_ms)
@@ -2900,6 +2990,7 @@ class beian:
                                 metrics.record(current_ip, "network", 0.0,
                                                retry=(attempt > 0),
                                                credential_id=_credential_stub(current_cred["token"]))
+                                self._note_ip_result(current_ip, "network")
                                 if attempt < 2:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.3 * (attempt + 1))
@@ -2996,6 +3087,7 @@ class beian:
                                         metrics.record(p_ip, req.status, _elapsed_ms,
                                                        retry=(attempt > 0),
                                                        credential_id=_credential_stub(p_cred["token"]))
+                                        self._note_ip_result(p_ip, req.status)
                                         stats['http_attempts'] += 1
                                         stats['latency_ms'] += _elapsed_ms
                                         stats['latency_max_ms'] = max(stats['latency_max_ms'], _elapsed_ms)
