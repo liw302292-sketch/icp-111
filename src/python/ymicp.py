@@ -663,6 +663,31 @@ class _QueryMetrics:
             lines.append(f"  CRED {cid}: req={c['n']} ok={c['ok']} "
                          f"403={c['403']}(rate={rate:.2f}) 429={c['429']} 5xx={c['5xx']} net={c['net']} "
                          f"avg={c_avg:.0f}ms")
+        # ── Credential 生命周期 / 资源效率（Commit B 目标：更少凭证完成更多 Query）──
+        if self.per_cred:
+            cn = [c["n"] for c in self.per_cred.values()]
+            lines.append("---- CREDENTIAL LIFETIME (queries per credential) ----")
+            lines.append(f"credential_count = {len(self.per_cred)}")
+            lines.append(f"avg_queries_per_credential = {sum(cn)/len(cn):.2f}")
+            lines.append(f"P50 = {self._percentile(cn, 0.50):.2f}")
+            lines.append(f"P75 = {self._percentile(cn, 0.75):.2f}")
+            lines.append(f"P90 = {self._percentile(cn, 0.90):.2f}")
+            lines.append(f"P95 = {self._percentile(cn, 0.95):.2f}")
+            lines.append(f"P99 = {self._percentile(cn, 0.99):.2f}")
+            lines.append(f"MAX = {max(cn)}")
+            lines.append(f"MIN = {min(cn)}")
+            # 依据 token_query_cap 判断：>=cap 视为自然结束，<cap 视为程序提前放弃
+            _cap = int(getattr(getattr(config, 'system', object()), 'token_query_cap', 60) or 60)
+            _natural = sum(1 for v in cn if v >= _cap)
+            _prem = sum(1 for v in cn if 0 < v < _cap)
+            lines.append(f"natural_ended_(>=cap_{_cap}) = {_natural}")
+            lines.append(f"abandoned_before_cap = {_prem}")
+        lines.append("---- RESOURCE EFFICIENCY ----")
+        _denom = max(1, completed)
+        lines.append(f"domains_per_captcha = {completed / captcha if captcha else 0.0:.2f}")
+        lines.append(f"domains_per_ipv6 = {completed / len(self.per_ip) if self.per_ip else 0.0:.2f}")
+        lines.append(f"captcha_per_1000_domains = {captcha / _denom * 1000.0:.1f}")
+        lines.append(f"ipv6_per_1000_domains = {len(self.per_ip) / _denom * 1000.0:.1f}")
         lines.append("====================================")
         return "\n".join(lines)
 
