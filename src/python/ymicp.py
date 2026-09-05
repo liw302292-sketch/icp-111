@@ -689,8 +689,7 @@ class beian:
         # 快速路径：缓存命中直接返回（无锁，高并发友好）
         if not force_refresh and not _force_refresh \
            and _captcha_count < _max_captcha \
-           and _token_expire > int(time.time() * 1000) \
-           and (_token_ipv6 is None or _token_ipv6 == ipv6):
+           and _token_expire > int(time.time() * 1000):
             logger.debug(f"♻️ 复用缓存Token (剩余{int((_token_expire-int(time.time()*1000))/1000)}s, IP={ipv6})")
             return True, _token, base_header
 
@@ -706,8 +705,7 @@ class beian:
             
             if not force_refresh and not _force_refresh2 \
                and _captcha_count2 < _max_captcha \
-               and _token_expire2 > int(time.time() * 1000) \
-               and (_token_ipv6_2 is None or _token_ipv6_2 == ipv6):
+               and _token_expire2 > int(time.time() * 1000):
                 logger.debug(f"♻️ 等锁后复用缓存Token")
                 return True, _token2, base_header
 
