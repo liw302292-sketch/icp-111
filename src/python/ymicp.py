@@ -1644,7 +1644,9 @@ class beian:
         
         # 结果 + 统计
         results = [None] * total
-        stats = {'ok': 0, 'fail': 0, 'reg': 0, 'retry': 0, 'captcha': 0, 'net_err': 0}
+        stats = {'ok': 0, 'fail': 0, 'reg': 0, 'retry': 0, 'captcha': 0, 'net_err': 0,
+                 'retry_total': 0, 'retry_success': 0, 'retry_exhausted': 0,
+                 'err': {}}
         stats_lock = asyncio.Lock()
         # 跨worker共享的连续失败计数：避免尾部多worker各自重试、反复空转
         shared_blocked_waits = 0
@@ -1675,6 +1677,25 @@ class beian:
         stats['tokens'] = 0
         _done_event = asyncio.Event()  # 🏁 全部结果完成信号：worker立即退出，消除尾部空等
         requeue_tracker = {}  # idx → 重入队次数, 限制每个域名最多重入队MAX_REQUEUE_ATTEMPTS次
+        domain_last_err = {}   # idx → 最后一次失败原因（重试耗尽时用于保留错误类别）
+
+        def _err_class(result):
+            s = str(result or "").lower()
+            if "timeout" in s:
+                return "network_timeout"
+            if any(k in s for k in ("connect", "reset", "winerror", "connection", "socket")):
+                return "network_connect_reset"
+            if s.startswith("http_5") or "503" in s or "502" in s or "504" in s:
+                return "server_5xx"
+            if s.startswith("ip_") or "429" in s or "rate" in s or "403" in s or "频" in s or "freq" in s:
+                return "rate_limit"
+            if "token" in s or "uuid" in s or "sign" in s or "非法" in s or "失效" in s or "过期" in s:
+                return "auth_invalid"
+            if "network" in s or "net" in s:
+                return "network_other"
+            if s in ("business", "biz_err") or "业务" in s:
+                return "business"
+            return "unknown"
         retry_heap = asyncio.PriorityQueue()  # 延迟重试队列: (ready_at, seq, idx, domain)
         retry_seq = 0
         t_start = _time.time()
@@ -1698,17 +1719,14 @@ class beian:
             return _dur
 
         async def schedule_retry(idx, domain, rc, kind="net"):
-            """按失败类型延迟重试：
-            403=瞬时挑战0.2s后重试（快消化尾部）;
-            429=换IP后立即重试（实测429是IP记忆型限流，换IP即恢复，无需长退避）;
-            网络错=短退避（实测多为IP硬化/连接被重置，换IP后立即重试成功率高）"""
+            """按失败类型延迟重试：403/429 走指数退避，让风控窗口冷却后再试。"""
             nonlocal retry_seq
             if kind == "403":
-                delay = 0.2
+                delay = min(2 * (2 ** min(rc, 5)), 60)   # 2s,4s,8s,16s,32s,60s
             elif kind == "429":
-                delay = 0.2  # 实测：429后被烧IP已换新IP，立即重试成功率高
+                delay = min(2 * (2 ** min(rc, 5)), 60)
             else:
-                delay = min(0.5 * (2 ** min(rc - 1, 4)), 8)   # 0.5s,1s,2s,4s,8s（快速消化尾部）
+                delay = min(0.5 * (2 ** min(rc - 1, 4)), 8)
             retry_seq += 1
             await retry_heap.put((_time.monotonic() + delay, retry_seq, idx, domain))
         
@@ -2463,9 +2481,12 @@ class beian:
                             rc = requeue_tracker.get(idx, 0)
                             if rc < MAX_REQUEUE_ATTEMPTS:
                                 requeue_tracker[idx] = rc + 1
+                                domain_last_err[idx] = result
                                 requeue_count += 1
                                 kind = "429" if result == "ip_429" else (
                                     "403" if result == "ip_403_streak" else "net")
+                                async with stats_lock:
+                                    stats['retry_total'] += 1
                                 try:
                                     await schedule_retry(idx, domain, rc, kind)
                                 except Exception:
@@ -2479,7 +2500,9 @@ class beian:
                                     pass
                                 async with stats_lock:
                                     stats['fail'] += 1
-                                    stats['net_err'] += 1
+                                    stats['retry_exhausted'] += 1
+                                    cls = _err_class(domain_last_err.get(idx, result))
+                                    stats['err'][cls] = stats['err'].get(cls, 0) + 1
                                     if stats['ok'] + stats['fail'] >= total:
                                         _done_event.set()
                                 # 🔥 也要推送结果到外层，否则 task.domains 会遗漏
@@ -2501,6 +2524,8 @@ class beian:
                             r = results[idx]
                             if r and r[1]:
                                 stats['ok'] += 1
+                                if requeue_tracker.get(idx, 0) > 0:
+                                    stats['retry_success'] += 1
                                 rd = r[2]
                                 if isinstance(rd, dict):
                                     rlist = rd.get("params", {}).get("list")
@@ -2508,8 +2533,9 @@ class beian:
                                         stats['reg'] += 1
                             else:
                                 stats['fail'] += 1
-                                # 区分网络错误
-                                if r and isinstance(r[2], str) and ('HTTP_' in r[2] or 'network' in r[2] or 'timeout' in r[2].lower()):
+                                cls = _err_class(r[2] if r else None)
+                                stats['err'][cls] = stats['err'].get(cls, 0) + 1
+                                if cls.startswith("network"):
                                     stats['net_err'] += 1
                             if stats['ok'] + stats['fail'] >= total:
                                 _done_event.set()
@@ -2639,8 +2665,12 @@ class beian:
             qps = total / elapsed if elapsed > 0 else 0
             qph = qps * 3600
             logger.info(f"📊 完成: {stats['ok']}/{total} API成功({stats['ok']*100//max(1,total)}%), "
-                        f"备案{stats['reg']}, 网络错{stats['net_err']}, "
-                        f"重试{stats['retry']}次, 打码{stats['tokens']}次(每IP独立token), "
+                        f"备案{stats['reg']}, 失败{stats['fail']}, "
+                        f"重试_total={stats['retry_total']} "
+                        f"重试成功={stats['retry_success']} "
+                        f"重试耗尽={stats['retry_exhausted']}, "
+                        f"错误分类={stats['err']}, "
+                        f"打码{stats['tokens']}次(每IP独立token), "
                         f"耗时{elapsed:.1f}s, 速度{qps:.0f}q/s ≈ {qph:.0f}QPH")
         except Exception as e:
             logger.error(f"💥 stream_query异常: {e}\n{traceback.format_exc()}")
