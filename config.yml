@@ -4,21 +4,24 @@ system:
   http_client_timeout: 30
   web_ui: true
   detail_concurrency: 10
-  batch_workers: 24  # 回到验证过的稳定档；加并发会让新/64的403被放大
-  ip_query_concurrency: 1  # 每IP串行，避免挑战页被并发触发
-  ip_query_interval: 0.6  # 每IP间隔，性能基线定档（0.5~0.6 为最优，0.6 资源效率更高）
-  token_query_cap: 60  # 每个IP独立token窗口内最多查询条数
-  ip_queries_per_rotation: 15  # 同一IP在窗口内连续查询条数后轮换IP
-  max_requeue_attempts: 3  # 单个域名被限流后的最大延迟重试次数（降低重试风暴）
+  batch_workers: 32  # 恢复历史高吞吐：32 worker（双前缀满编；与旧版高吞吐日志一致）
+  ip_query_concurrency: 3  # 恢复历史高吞吐：每IP 3路并发（实测26.8q/s且token复用最好）
+  ip_query_interval: 0.5  # 恢复历史高吞吐：0.5s安全间隔（实测优于0.6）
+  token_query_cap: 200  # token生命周期上限
+  credential_query_cap: 20  # 🔑 单sign最多服务查询数(达限换新sign,防一把钥匙开太多锁)
+  ip_queries_per_rotation: 5  # ★实测：单IP重复被WAF放行的有效200仅~6条，第7条起403；设7条即换避免每IP浪费30+个403请求
+  max_requeue_attempts: 10  # 恢复历史高吞吐：延迟重试10次（指数退避，提高恢复率）
   enable_stream_batch: true  # 多IP流式批量（共享token窗口 + 多IP轮换，429自动换IP）
-  shared_token_batch: false  # 单IP独立token；共享token实测不提升反而更慢
+  shared_token_batch: true  # 恢复八月初高吞吐：整个任务1次取号打码，同一token轮流用多个IP（单IP窗口~30条，200条需6-8IP）
   shared_queries_per_ip: 30  # 共享模式下每IP查询数（低于WAF硬化阈值，保留备用）
+  token_prefetch_count: 12  # 恢复历史高吞吐：初始预热token数（代码按剩余域名所需token数封顶）
+  captcha_concurrency: 8  # 恢复历史高吞吐：打码并发8（4路会让取号排队变慢）
 captcha:
   enable: true
   save_failed_img: false
   save_failed_img_path: faile_captcha
   retry_times: 2
-  max_per_token: 60  # per-captcha query window (reuse token longer to reduce auth bottleneck)
+  max_per_token: 100  # 恢复历史高吞吐：per-captcha query window 100（实测单token窗口≈100条）
   queries_per_ip: 20  # 每个worker每批拉取域名数（实测批次大小）
 proxy:
   local_ipv6_pool:
@@ -67,3 +70,10 @@ auth:
 mcp:
   enable: false
   port: 16182
+
+
+
+
+
+
+
