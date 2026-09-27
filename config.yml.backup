@@ -4,17 +4,25 @@ system:
   http_client_timeout: 30
   web_ui: true
   detail_concurrency: 10
+  batch_workers: 32  # 双前缀满编
+  ip_query_concurrency: 3  # 每IP分片并发3路（实测4路更慢）
+  ip_query_interval: 0.5  # 同一IP查询发送间隔（秒，实测0.5s安全）
+  token_query_cap: 60  # 每个IP独立token窗口内最多查询条数
+  ip_queries_per_rotation: 20  # 同一IP窗口内查询条数后轮换（实测20最优：59q/s vs 90=50q/s）
+  max_requeue_attempts: 10  # 单个域名被限流后的最大延迟重试次数（指数退避）
+  enable_stream_batch: true  # 多IP流式批量（共享token窗口 + 多IP轮换，429自动换IP）
+  max_batch_size: 1000000  # 单次批量任务最大条数上限，超出会提示 batch size exceeds
 captcha:
   enable: true
   save_failed_img: false
   save_failed_img_path: faile_captcha
   retry_times: 2
-  max_per_token: 40  # 每次打码后查40条(优化后黄金窗口，目标95%+成功率)
-  queries_per_ip: 40  # 优化后: 40条/批 + 子批次10条 + IP被限换IP重查
+  max_per_token: 100  # per-captcha query window (实测单token窗口≈100条)
+  queries_per_ip: 20  # 每个worker每批拉取域名数（进度上报粒度，token复用由rotation=90控制）
 proxy:
   local_ipv6_pool:
     enable: true
-    pool_num: 100
+    pool_num: 600  # 双前缀满编：约300家宽 + 300手机，两个独立窗口同时出量
     check_interval: 1
     ipv6_network_card: 以太网
   tunnel:
@@ -58,3 +66,9 @@ auth:
 mcp:
   enable: false
   port: 16182
+
+
+
+
+
+

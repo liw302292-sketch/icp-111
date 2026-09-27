@@ -1371,6 +1371,8 @@ class beian:
             base_header["Content-Type"] = "application/json"
             
             # 获取验证码图片
+            req_status = None
+            res_text = ""
             try:
                 async with self.get_session(proxy, ipv6=ipv6) as session:
                     async with session.post(self.getCheckImage, data=data, headers=base_header, proxy=proxy if proxy else None) as req:
@@ -1380,10 +1382,16 @@ class beian:
                                 self.merge_cookies_into(base_header, set_cookies)
                         except Exception:
                             pass
+                        req_status = getattr(req, "status", None)
                         res_text = await req.text()
                         res = ujson.loads(res_text)
             except BaseException as e:
-                logger.info(f"请求验证码时失败：{e}")
+                err_detail = f"{type(e).__name__}: {e}"
+                if req_status is not None:
+                    err_detail += f" | HTTP={req_status}"
+                if res_text:
+                    err_detail += f" | body={res_text[:200]!r}"
+                logger.warning(f"请求验证码时失败：{err_detail}")
                 # 403 / 非JSON响应 = Token可能已失效，触发强制轮换
                 if ctx:
                     ctx.consecutive_fails += 1
@@ -1395,7 +1403,7 @@ class beian:
                     if self._token_consecutive_fails >= 2:
                         logger.warning(f"⛔ 获取验证码连续{self._token_consecutive_fails}次失败，标记Token强制刷新")
                         self._token_force_refresh = True
-                return False, f"请求验证码时失败：{e}", '', '', ''
+                return False, f"请求验证码时失败：{err_detail}", '', '', ''
 
             _t_getimg = time.time()
             logger.info(f"⏱️ auth={(_t_token-_t0)*1000:.0f}ms, getImg={(_t_getimg-_t_token)*1000:.0f}ms")
