@@ -15,10 +15,10 @@ async def one(icp, ip):
         return False
 
 
-async def run(conc, duration, ip_pool):
+async def run(conc, interval, duration, ip_pool):
     icp = beian()
     icp._auth_semaphore = asyncio.Semaphore(conc)
-    icp._auth_min_interval = 0.1 if conc > 2 else 0.25
+    icp._auth_min_interval = interval
     t0 = time.time()
     ok = 0
     total = 0
@@ -36,8 +36,8 @@ async def run(conc, duration, ip_pool):
 
     await asyncio.gather(*[worker() for _ in range(conc)])
     el = time.time() - t0
-    print(f"conc={conc} 尝试={total} 成功={ok} 成功率={ok*100//max(1,total)}% "
-          f"补给速率={ok/el:.2f}/s 耗时={el:.0f}s", flush=True)
+    print(f"conc={conc} interval={interval} 尝试={total} 成功={ok} "
+          f"成功率={ok*100//max(1,total)}% 补给速率={ok/el:.2f}/s 耗时={el:.0f}s", flush=True)
 
 
 async def main():
@@ -45,9 +45,10 @@ async def main():
     ip_pool = [a for a in get_local_ipv6_addresses() if a.startswith("2409:8a1a")]
     random.shuffle(ip_pool)
     print(f"IP池={len(ip_pool)} 每轮{duration}s", flush=True)
-    concs = [int(x) for x in sys.argv[2].split(",")] if len(sys.argv) > 2 else [4, 8, 12]
-    for conc in concs:
-        await run(conc, duration, ip_pool)
+    combos = sys.argv[2] if len(sys.argv) > 2 else "8:0.1,8:0.0,12:0.0,16:0.0"
+    for c in combos.split(","):
+        conc, interval = c.split(":")
+        await run(int(conc), float(interval), duration, ip_pool)
         await asyncio.sleep(5)
 
 
