@@ -2132,6 +2132,10 @@ class beian:
         stats_lock = asyncio.Lock()
         # 跨worker共享的连续失败计数：避免尾部多worker各自重试、反复空转
         shared_blocked_waits = 0
+        pool_exhausted_since = 0.0  # 池子开始全被封的时刻（用于按时间判断放弃）
+        # IP池全被封后，最多坚持等这么久再放弃（创宇盾最长封1800s，留足余量）
+        POOL_EXHAUSTED_GIVEUP = max(600.0, float(getattr(
+            getattr(config, 'system', object()), 'pool_exhausted_giveup_seconds', 2400) or 2400))
         # 跨worker的IP独占认领：动态补充的新IP不允许被多个worker同时使用，
         # 避免同IP并发打auth被创宇盾拦截（池子越小越关键）
         claimed_ips = set()
@@ -2417,7 +2421,7 @@ class beian:
         async def ip_worker(ip_slice, worker_id):
             """实测验证方案：每IP独立token + IP独占轮转 + ≤2q/s/IP + 403立即重试。
             硬429（访问频次过高）才拉黑IP（1800s），403挑战页不拉黑。"""
-            nonlocal shared_blocked_waits, pace_ok, pace_attempts, slow_mode
+            nonlocal shared_blocked_waits, pace_ok, pace_attempts, slow_mode, pool_exhausted_since
             try:
                 if shared_mode:
                     # 共享模式取号是瞬时的（无真实auth错峰），worker同时开火会撞429；
@@ -2506,9 +2510,15 @@ class beian:
                     if not any([not await self._is_ip_blocked(a) for a in exit_slots]):
                         shared_blocked_waits += 1
                         wait = min(30 * shared_blocked_waits, 120)  # 30s起，上限2分钟
-                        logger.warning(f"⏳ W{worker_id}: 所有IP被封，等待{wait}s（第{shared_blocked_waits}次/60）")
-                        if shared_blocked_waits >= 60:
-                            logger.warning(f"⏳ W{worker_id}: IP池持续耗尽（等待{shared_blocked_waits}次后放弃），本批标记失败")
+                        if pool_exhausted_since == 0.0:
+                            pool_exhausted_since = _time.time()
+                        exhausted_for = _time.time() - pool_exhausted_since
+                        logger.warning(f"⏳ W{worker_id}: 所有IP被封，等待{wait}s"
+                                       f"（已持续{exhausted_for:.0f}s/{POOL_EXHAUSTED_GIVEUP}s）")
+                        # 创宇盾封禁是限时的（最长 1800s），必须等到 IP 恢复；
+                        # 之前按“等待60次”提前放弃，导致整个队列被丢弃（实测丢过 9 万条）。
+                        if exhausted_for >= POOL_EXHAUSTED_GIVEUP:
+                            logger.warning(f"⏳ W{worker_id}: IP池持续耗尽{exhausted_for:.0f}s仍未恢复，本批标记失败")
                             await fail_batch("ip_pool_exhausted")
                             return
                         # 分段等待并定期重查：新替换的IP一旦可用就立刻恢复工作
@@ -2526,6 +2536,7 @@ class beian:
 
                     # ── 每IP独立token + 独占轮转 + 逐条限速 ──
                     shared_blocked_waits = 0
+                    pool_exhausted_since = 0.0  # IP 恢复可用，重置池耗尽计时
 
                     async def ensure_ip_ready():
                         """确保当前IP可用且token有效；否则轮换到下一个未封IP并重新打码。"""

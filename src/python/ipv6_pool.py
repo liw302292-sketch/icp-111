@@ -338,7 +338,9 @@ class IPv6AddressPool:
         # 不要为了补几百个地址同步空转；每次只小批量补，失败就退避。
         # 扩大尝试次数与失败容忍，给 DAD(重复地址检测) 留足时间，
         # 否则新增 IPv6 在短暂 Tentative 状态会被误判为“未检测到”而提前放弃。
-        max_attempts = min(max(1, count * 2), 200)
+        # 小批量时也要给足尝试次数：实测 count=1 时 2 次尝试常被判“未检测到新地址”，
+        # 实际是 DAD 未完成/读取延迟，导致补址失败、池子无法恢复。
+        max_attempts = min(max(5, count * 2), 200)
         attempts = 0
         consecutive_fail = 0
 
@@ -352,7 +354,7 @@ class IPv6AddressPool:
                     1,
                     self.network_card,
                 )
-                await asyncio.sleep(0.2)  # 等待系统应用配置
+                await asyncio.sleep(0.5)  # 等待系统应用配置(DAD)
 
                 # 重新获取系统地址
                 old_system_addresses = set(self.system_addresses)
