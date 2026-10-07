@@ -25,6 +25,8 @@ from collections import deque
 from load_config import config
 from cachetools import TTLCache
 from utils import get_project_root
+from dataclasses import dataclass, field
+import perf_monitor
 
 ssl._create_default_https_context = ssl._create_unverified_context()
 
@@ -325,6 +327,97 @@ def get_local_ipv6_addresses():
     return list(dict.fromkeys(addresses))
 
 
+@dataclass
+class IPState:
+    """单个 IPv6 出口的网络状态（不含认证信息）。
+
+    目标是让“每个 IP 的状态”独立于“每次请求/凭证”，避免全局 _ip_queries_used 之类的
+    单值状态在不同任务间互相污染。
+    """
+    ipv6: str
+    request_count: int = 0
+    success_count: int = 0
+    network_error_count: int = 0
+    consecutive_failures: int = 0
+    consecutive_403: int = 0
+    last_success: float = 0.0
+    last_request_time: float = 0.0
+    cooldown_until: float = 0.0
+    health: str = "unknown"
+
+    @property
+    def healthy(self) -> bool:
+        return self.health not in ("cooldown", "unreachable", "bad")
+
+    @property
+    def load(self) -> int:
+        return self.request_count
+
+    @property
+    def request_403_count(self) -> int:
+        return self.consecutive_403
+
+    @property
+    def request_403_rate(self) -> float:
+        return self.consecutive_403 / self.request_count if self.request_count else 0.0
+
+
+@dataclass
+class CredentialState:
+    """单个认证凭证的生命周期状态（与 IP 解耦）。
+
+    query 执行阶段只读取 credential，不负责验证码/取号细节。
+    """
+    token: str = ""
+    token_expire: int = 0
+    token_ipv6: str | None = None
+    captcha_count: int = 0
+    auth_count: int = 0
+    captcha_attempts: int = 0
+    captcha_success: int = 0
+    consecutive_fails: int = 0
+    force_refresh: bool = False
+    credential_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    status: str = "idle"
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.token) and self.token_expire > int(time.time() * 1000)
+
+
+@dataclass
+class ExecutionContext:
+    """一次真实 Query 的轻量 trace 记录（纯观测，不参与调度）。
+
+    只记录事实：哪个 domain、用了哪个 IP / Session / Credential、何时开始结束、
+    HTTP 状态、结果类型、是否成功、因重试而发出多少次 HTTP 查询。
+    不负责选择 IP、选择 Credential、retry、刷新 Token、改变调度。
+    """
+    domain: str = ""
+    ipv6: str = ""
+    credential_id: str = ""
+    token_expire: int = 0
+    start_time: float = 0.0
+    end_time: float = 0.0
+    http_status: object = None  # int HTTP status 或 "network"
+    result_type: str = ""
+    success: bool = False
+    retry_count: int = 0
+
+    @property
+    def latency_ms(self) -> float:
+        if self.end_time and self.start_time:
+            return (self.end_time - self.start_time) * 1000.0
+        return 0.0
+
+
+def _credential_stub(token: str) -> str:
+    """稳定的内部凭证标识（不打印完整 Token）。token 为空时返回 'n/a'。"""
+    if not token:
+        return "n/a"
+    return hashlib.md5(token.encode("utf-8")).hexdigest()[:8]
+
+
 class QueryContext:
     """隔离的查询上下文 - 每个IP+Token组合独立一份，支持并发安全"""
     __slots__ = ('ipv6', 'token', 'token_expire', 'token_ipv6',
@@ -359,7 +452,9 @@ class _QueryMetrics:
         "started", "completed", "attempts", "retry",
         "http_200", "http_403", "http_429", "http_5xx",
         "network_error", "latency_total_ms", "latency_max_ms",
-        "latency_samples", "per_ip"
+        "latency_samples", "traces", "per_ip", "per_cred",
+        "auth_count", "captcha_count", "active_workers",
+        "domain_total", "domain_ok", "domain_fail",
     )
 
     def __init__(self):
@@ -374,10 +469,59 @@ class _QueryMetrics:
         self.network_error = 0
         self.latency_total_ms = 0.0
         self.latency_max_ms = 0.0
-        self.latency_samples = deque(maxlen=2048)
+        self.latency_samples = deque(maxlen=4096)
+        self.traces = deque(maxlen=2048)  # 最近 2048 次查询的 ExecutionContext 快照
         self.per_ip = {}
+        self.per_cred = {}
+        self.auth_count = 0
+        self.captcha_count = 0
+        self.active_workers = 0
+        self.domain_total = 0
+        self.domain_ok = 0
+        self.domain_fail = 0
 
-    def record(self, ip, status, elapsed_ms, completed=False, retry=False):
+    def _ip_item(self, ip):
+        item = self.per_ip.get(ip)
+        if item is None:
+            item = {"n": 0, "ok": 0, "403": 0, "429": 0, "5xx": 0, "net": 0,
+                    "lat_ms": 0.0, "lat": deque(maxlen=512)}
+            self.per_ip[ip] = item
+        return item
+
+    def _cred_item(self, cid):
+        item = self.per_cred.get(cid)
+        if item is None:
+            item = {"n": 0, "ok": 0, "403": 0, "429": 0, "5xx": 0, "net": 0,
+                    "tok_err": 0, "lat_ms": 0.0, "lat": deque(maxlen=512)}
+            self.per_cred[cid] = item
+        return item
+
+    @staticmethod
+    def _bucket(status):
+        if status == 200:
+            return "ok"
+        if status == 403:
+            return "403"
+        if status == 429:
+            return "429"
+        if isinstance(status, int) and status >= 500:
+            return "5xx"
+        if status == "network":
+            return "net"
+        return None
+
+    def record(self, ip, status, elapsed_ms, completed=False, retry=False, credential_id=None):
+        _now = time.time()
+        self.traces.append(ExecutionContext(
+            ipv6=ip or "",
+            credential_id=credential_id or "",
+            start_time=_now - (elapsed_ms / 1000.0),
+            end_time=_now,
+            http_status=status,
+            result_type=self._bucket(status) or "unknown",
+            success=(status == 200),
+            retry_count=1 if retry else 0,
+        ))
         self.attempts += 1
         if retry:
             self.retry += 1
@@ -387,42 +531,225 @@ class _QueryMetrics:
             self.latency_samples.append(elapsed_ms)
         if completed:
             self.completed += 1
-        if status == 200:
+        buck = self._bucket(status)
+        if buck == "ok":
             self.http_200 += 1
-        elif status == 403:
+        elif buck == "403":
             self.http_403 += 1
-        elif status == 429:
+        elif buck == "429":
             self.http_429 += 1
-        elif isinstance(status, int) and status >= 500:
+        elif buck == "5xx":
             self.http_5xx += 1
-        elif status == "network":
+        elif buck == "net":
             self.network_error += 1
 
         if ip:
-            item = self.per_ip.setdefault(ip, {"n": 0, "ok": 0, "403": 0, "429": 0, "5xx": 0, "net": 0, "lat_ms": 0.0})
+            item = self._ip_item(ip)
             item["n"] += 1
             item["lat_ms"] += elapsed_ms
-            if status == 200:
-                item["ok"] += 1
-            elif status == 403:
-                item["403"] += 1
-            elif status == 429:
-                item["429"] += 1
-            elif isinstance(status, int) and status >= 500:
-                item["5xx"] += 1
-            elif status == "network":
-                item["net"] += 1
+            if elapsed_ms > 0:
+                item["lat"].append(elapsed_ms)
+            if buck:
+                item[buck] += 1
+
+        if credential_id:
+            c = self._cred_item(credential_id)
+            c["n"] += 1
+            c["lat_ms"] += elapsed_ms
+            if elapsed_ms > 0:
+                c["lat"].append(elapsed_ms)
+            if buck:
+                c[buck] += 1
+
+    @staticmethod
+    def _percentile(samples, p):
+        if not samples:
+            return 0.0
+        values = sorted(samples)
+        return values[min(len(values) - 1, int(len(values) * p))]
+
+    @property
+    def p50_latency_ms(self):
+        return self._percentile(self.latency_samples, 0.50)
+
+    @property
+    def p90_latency_ms(self):
+        return self._percentile(self.latency_samples, 0.90)
+
+    @property
+    def p95_latency_ms(self):
+        return self._percentile(self.latency_samples, 0.95)
+
+    @property
+    def p99_latency_ms(self):
+        return self._percentile(self.latency_samples, 0.99)
 
     @property
     def avg_latency_ms(self):
         return self.latency_total_ms / self.attempts if self.attempts else 0.0
 
-    @property
-    def p95_latency_ms(self):
-        if not self.latency_samples:
-            return 0.0
-        values = sorted(self.latency_samples)
-        return values[min(len(values) - 1, int(len(values) * 0.95))]
+    def baseline(self, elapsed, total, domain_ok, domain_fail, retry, auth, captcha, workers):
+        """输出统一性能基线（只读统计，不改变任何状态）。"""
+        attempts = self.attempts
+        completed = domain_ok
+        business_qps = completed / elapsed if elapsed > 0 else 0.0
+        http_rps = attempts / elapsed if elapsed > 0 else 0.0
+        retry_amp = attempts / max(1, completed)
+        http_403_rate = self.http_403 / attempts if attempts else 0.0
+        lines = [
+            "========== QUERY BASELINE ==========",
+            f"elapsed_sec           = {elapsed:.3f}",
+            f"total_domains         = {total}",
+            f"completed_domains     = {domain_ok}",
+            f"failed_domains        = {domain_fail}",
+            f"http_query_attempts   = {attempts}",
+            f"successful_http       = {self.http_200}",
+            f"business_qps          = {business_qps:.3f}",
+            f"http_rps              = {http_rps:.3f}",
+            f"retry_amplification   = {retry_amp:.3f}",
+            f"p50_latency_ms        = {self.p50_latency_ms:.1f}",
+            f"p90_latency_ms        = {self.p90_latency_ms:.1f}",
+            f"p95_latency_ms        = {self.p95_latency_ms:.1f}",
+            f"p99_latency_ms        = {self.p99_latency_ms:.1f}",
+            f"max_latency_ms        = {self.latency_max_ms:.1f}",
+            f"http_403              = {self.http_403}",
+            f"http_403_rate         = {http_403_rate:.3f}",
+            f"http_429              = {self.http_429}",
+            f"http_5xx              = {self.http_5xx}",
+            f"auth_count            = {auth}",
+            f"captcha_count         = {captcha}",
+            f"active_workers        = {workers}",
+        ]
+        # ── IP / 403 分布（判断负载是否均匀）──
+        def _median(v):
+            if not v:
+                return 0.0
+            s = sorted(v)
+            return s[len(s) // 2] if len(s) % 2 else (s[len(s)//2 - 1] + s[len(s)//2]) / 2.0
+
+        if self.per_ip:
+            reqs = [it["n"] for it in self.per_ip.values()]
+            rates403 = [it["403"] / it["n"] if it["n"] else 0.0 for it in self.per_ip.values()]
+            _mean = sum(reqs) / len(reqs)
+            _var = sum((r - _mean) ** 2 for r in reqs) / len(reqs)
+            _stdev = _var ** 0.5
+            _cv = _stdev / _mean if _mean else 0.0
+            lines.append("---- IP LOAD DISTRIBUTION ----")
+            lines.append(f"total_ip = {len(self.per_ip)}")
+            lines.append(f"mean_requests = {_mean:.2f}")
+            lines.append(f"median_requests = {_median(reqs):.2f}")
+            lines.append(f"p90_requests = {self._percentile(reqs, 0.90):.2f}")
+            lines.append(f"p95_requests = {self._percentile(reqs, 0.95):.2f}")
+            lines.append(f"max_requests = {max(reqs)}")
+            lines.append(f"coefficient_of_variation = {_cv:.3f}")
+            lines.append("---- 403 DISTRIBUTION (per IP) ----")
+            lines.append(f"mean_ip_403_rate = {sum(rates403)/len(rates403):.3f}")
+            lines.append(f"median_ip_403_rate = {_median(rates403):.3f}")
+            lines.append(f"p90_ip_403_rate = {self._percentile(rates403, 0.90):.3f}")
+            lines.append(f"max_ip_403_rate = {max(rates403):.3f}")
+
+        lines.append("---- P(403 | IP) top ----")
+        for ip, it in sorted(self.per_ip.items(), key=lambda kv: -kv[1]["403"])[:10]:
+            ip_avg = it["lat_ms"] / it["n"] if it["n"] else 0.0
+            ip_p50 = self._percentile(it["lat"], 0.50)
+            ip_p95 = self._percentile(it["lat"], 0.95)
+            rate = it["403"] / it["n"] if it["n"] else 0.0
+            lines.append(f"  IP {ip}: req={it['n']} ok={it['ok']} "
+                         f"403={it['403']}(rate={rate:.2f}) 429={it['429']} 5xx={it['5xx']} net={it['net']} "
+                         f"avg={ip_avg:.0f}ms p50={ip_p50:.0f} p95={ip_p95:.0f}")
+        lines.append("---- P(403 | Credential) top ----")
+        for cid, c in sorted(self.per_cred.items(), key=lambda kv: -kv[1]["403"])[:10]:
+            c_avg = c["lat_ms"] / c["n"] if c["n"] else 0.0
+            rate = c["403"] / c["n"] if c["n"] else 0.0
+            lines.append(f"  CRED {cid}: req={c['n']} ok={c['ok']} "
+                         f"403={c['403']}(rate={rate:.2f}) 429={c['429']} 5xx={c['5xx']} net={c['net']} "
+                         f"avg={c_avg:.0f}ms")
+        # ── Credential 生命周期 / 资源效率（Commit B 目标：更少凭证完成更多 Query）──
+        if self.per_cred:
+            cn = [c["n"] for c in self.per_cred.values()]
+            lines.append("---- CREDENTIAL LIFETIME (queries per credential) ----")
+            lines.append(f"credential_count = {len(self.per_cred)}")
+            lines.append(f"avg_queries_per_credential = {sum(cn)/len(cn):.2f}")
+            lines.append(f"P50 = {self._percentile(cn, 0.50):.2f}")
+            lines.append(f"P75 = {self._percentile(cn, 0.75):.2f}")
+            lines.append(f"P90 = {self._percentile(cn, 0.90):.2f}")
+            lines.append(f"P95 = {self._percentile(cn, 0.95):.2f}")
+            lines.append(f"P99 = {self._percentile(cn, 0.99):.2f}")
+            lines.append(f"MAX = {max(cn)}")
+            lines.append(f"MIN = {min(cn)}")
+            # 依据 token_query_cap 判断：>=cap 视为自然结束，<cap 视为程序提前放弃
+            _cap = int(getattr(getattr(config, 'system', object()), 'token_query_cap', 60) or 60)
+            _natural = sum(1 for v in cn if v >= _cap)
+            _prem = sum(1 for v in cn if 0 < v < _cap)
+            lines.append(f"natural_ended_(>=cap_{_cap}) = {_natural}")
+            lines.append(f"abandoned_before_cap = {_prem}")
+        lines.append("---- RESOURCE EFFICIENCY ----")
+        _denom = max(1, completed)
+        _eqr = self.http_200 / attempts if attempts else 0.0
+        lines.append(f"domains_per_captcha = {completed / captcha if captcha else 0.0:.2f}")
+        lines.append(f"domains_per_ipv6 = {completed / len(self.per_ip) if self.per_ip else 0.0:.2f}")
+        lines.append(f"captcha_per_1000_domains = {captcha / _denom * 1000.0:.1f}")
+        lines.append(f"ipv6_per_1000_domains = {len(self.per_ip) / _denom * 1000.0:.1f}")
+        # 有效请求比例：每发出 100 次 HTTP Query，真正变成有效业务结果的比例。
+        lines.append(f"effective_query_ratio = {_eqr:.3f}")
+        lines.append("====================================")
+        return "\n".join(lines)
+
+    def summary_dict(self, elapsed, total, domain_ok, domain_fail, retry, auth, captcha, workers):
+        """返回机器可读的性能指标字典（口径与 baseline() 完全一致，纯统计）。"""
+        attempts = self.attempts
+        completed = domain_ok
+        business_qps = completed / elapsed if elapsed > 0 else 0.0
+        http_rps = attempts / elapsed if elapsed > 0 else 0.0
+        retry_amp = attempts / max(1, completed)
+        http_403_rate = self.http_403 / attempts if attempts else 0.0
+        eqr = self.http_200 / attempts if attempts else 0.0
+        denom = max(1, completed)
+        sp = {
+            "elapsed_sec": elapsed,
+            "total_domains": total,
+            "completed_domains": domain_ok,
+            "failed_domains": domain_fail,
+            "http_query_attempts": attempts,
+            "successful_http": self.http_200,
+            "business_qps": business_qps,
+            "http_rps": http_rps,
+            "retry_amplification": retry_amp,
+            "effective_query_ratio": eqr,
+            "http_403": self.http_403,
+            "http_403_rate": http_403_rate,
+            "captcha_count": captcha,
+            "captcha_per_1000_domains": captcha / denom * 1000.0,
+            "domains_per_captcha": completed / captcha if captcha else 0.0,
+            "unique_ipv6": len(self.per_ip),
+            "ipv6_per_1000_domains": len(self.per_ip) / denom * 1000.0,
+            "domains_per_ipv6": completed / len(self.per_ip) if self.per_ip else 0.0,
+            "unique_credentials": len(self.per_cred),
+            "domains_per_credential": completed / len(self.per_cred) if self.per_cred else 0.0,
+            "avg_queries_per_credential": (
+                sum(c["n"] for c in self.per_cred.values()) / len(self.per_cred)
+                if self.per_cred else 0.0),
+            "p50_latency_ms": self.p50_latency_ms,
+            "p90_latency_ms": self.p90_latency_ms,
+            "p95_latency_ms": self.p95_latency_ms,
+            "p99_latency_ms": self.p99_latency_ms,
+            "max_latency_ms": self.latency_max_ms,
+            "http_429": self.http_429,
+            "http_5xx": self.http_5xx,
+            "auth_count": auth,
+            "active_workers": workers,
+            "active_ip": len(self.per_ip),
+            "active_credentials": len(self.per_cred),
+        }
+        # IP 负载偏斜：CV = std(request_count) / mean(request_count)
+        if self.per_ip:
+            reqs = [it["n"] for it in self.per_ip.values()]
+            mean = sum(reqs) / len(reqs)
+            var = sum((r - mean) ** 2 for r in reqs) / len(reqs)
+            sp["ip_load_cv"] = (var ** 0.5) / mean if mean else 0.0
+        else:
+            sp["ip_load_cv"] = 0.0
+        return sp
 
 
 class _GlobalPace:
@@ -483,8 +810,6 @@ class beian:
         # APP/小程序/快应用详情查询接口
         self.queryDetailByAppAndMiniId = "https://hlwicpfwc.miit.gov.cn/icpproject_query/api/icpAbbreviateInfo/queryDetailByAppAndMiniId"
         self.sign = "eyJ0eXBlIjozLCJleHREYXRhIjp7InZhZnljb2RlX2ltYWdlX2tleSI6IjUyZWI1ZTcyODViNzRmNWJhM2YwYzBkNTg0YTg3NmVmIn0sImUiOjE3NTY5NzAyNDg4MjN9.Ngpkwn4T7sQoQF9pCk_sQQpH61wQUEKnK2sQ8hDIq-Q"
-        self.token = ""
-        self.token_expire = 0
         self.timeout = aiohttp.ClientTimeout(total=getattr(getattr(config, 'system', object()), 'http_client_timeout', 30) or 30)
         self.local_ipv6_addresses = get_local_ipv6_addresses() if getattr(getattr(getattr(config, 'proxy', object()), 'local_ipv6_pool', object()), 'enable', False) else []
         self.ipv6_index = 0
@@ -538,29 +863,23 @@ class beian:
         # === Token 轮换机制（解决"一把钥匙"问题）===
         # 同一个 Token 请求验证码过多会被 MIIT 服务器限制
         # 策略：每个 Token 最多打码 N 次后强制刷新，失败时也触发轮换
-        self._token_captcha_count = 0  # 当前Token已打码次数
-        self._token_consecutive_fails = 0  # 连续打码失败次数
         self._max_captcha_per_token = getattr(
             getattr(config, 'captcha', object()), 'max_per_token', 60
         ) or 60  # 每Token最大打码次数，默认60
-        self._token_force_refresh = False  # 强制刷新标记
+        # CredentialState：单个凭证的权威状态（token/expire/打码计数/锁），
+        # 取代原先分散的 self.token / self._token_* 实例字段。
+        self._credential = CredentialState()
         # 每IP查询配额（批量模式按配额轮换IP，避免单IP被限流/封禁）
         self._queries_per_ip = getattr(
             getattr(config, 'captcha', object()), 'queries_per_ip', 20
         ) or 20
-        self._ip_queries_used = 0  # 当前粘性IP已查询次数
         # 每IP稳定浏览器身份档案：一个IP一个身份（UA/Sec-Ch-Ua/语言/cookie），防跨IP共享指纹
         self._ip_fingerprints = {}
+        # IPState：每个出口独立的网络状态（request_count/health/cooldown），
+        # 替代原先单一的 self._ip_queries_used，避免不同任务共享同一计数器。
+        self._ip_states: dict = {}
 
-        # === 验证码预取池（已禁用：改为每个查询独立打码） ===
-        self._captcha_pool = asyncio.Queue(maxsize=10)
-        self._captcha_filler_running = False
-        self._captcha_filler_tasks = []
-        self._captcha_filler_count = 0   # 禁用填充器
-        
-        # === Token 获取专用锁（防止并发重复auth） ===
-        self._token_fetch_lock = asyncio.Lock()
-        self._token_ipv6 = None  # 记录Token绑定的IPv6（MIIT可能校验来源IP一致性）
+        # 验证码改为每个查询独立内联打码（预取池/填充器已移除，避免死代码）
 
         # === 全局取号节流（关键）===
         # 实测：auth 突发（≥4路并发连续打）会让创宇盾对 auth 接口限流，
@@ -568,8 +887,8 @@ class beian:
         # 全局串行 + 最小间隔250ms ≈ 4次/s，足够24 worker每token≈30条的需求。
         self._auth_gate = asyncio.Lock()
         self._last_auth_ts = 0.0
-        self._auth_min_interval = 0.0  # 实测：该间隔闸对补给速率无影响（0.1 vs 0 结果一致），已移除
-        self._auth_semaphore = asyncio.Semaphore(16)  # 实测：补给随并发线性增长到32，16并发=8.6/s
+        self._auth_min_interval = 0.0   # 实测：该间隔闸对补给速率无影响，已移除
+        self._auth_semaphore = asyncio.Semaphore(16)  # 实测：补给随并发线性增长，16 并发最佳
         self._auth_waf_fail_streak = 0  # 全局 auth WAF 连续失败计数
         self._auth_global_cooldown_until = 0.0  # 全局 auth 风控冷却截止时间
         
@@ -632,97 +951,6 @@ class beian:
         self._shared_consumed = set()
         self._shared_active = False
 
-    # === 验证码预取池：后台持续打码 ===
-    async def _captcha_filler(self):
-        """后台任务：持续预取验证码，保持池满"""
-        logger.info(f"🔧 验证码预取池启动 (容量={self._captcha_pool_size})")
-        self._captcha_filler_running = True
-        while self._captcha_filler_running:
-            try:
-                if self._captcha_pool.full():
-                    await asyncio.sleep(0.05)
-                    continue
-                
-                # 检查Token是否需要轮换
-                if self._token_captcha_count >= self._max_captcha_per_token:
-                    self._token_force_refresh = True
-                
-                # 预取使用独立IP轮换（不干扰查询的粘性IP）
-                ipv6 = await self._get_next_ipv6() if self.local_ipv6_addresses else None
-                
-                # 获取token
-                success, token, base_header = await self.get_token(ipv6=ipv6)
-                if not success:
-                    await asyncio.sleep(0.3)
-                    continue
-                
-                # 获取验证码图片
-                data = self.get_clientUid()
-                h = base_header.copy()
-                h["token"] = token
-                h["Content-Type"] = "application/json"
-                
-                try:
-                    async with self.get_session(ipv6=ipv6) as session:
-                        async with session.post(self.getCheckImage, data=data, headers=h) as req:
-                            res = await req.json()
-                except BaseException:
-                    await asyncio.sleep(0.2)
-                    continue
-                
-                p_uuid = res["params"]["uuid"]
-                big_image = res["params"]["bigImage"]
-                small_image = res["params"]["smallImage"]
-                
-                # 滑块匹配
-                match_success, offset_x = self.match_slider_offset(small_image, big_image)
-                if not match_success:
-                    await asyncio.sleep(0.05)
-                    continue
-                
-                # 提交验证码
-                check_data = ujson.dumps({"key": p_uuid, "value": str(offset_x)})
-                h["Content-Length"] = str(len(check_data.encode("utf-8")))
-                
-                try:
-                    async with self.get_session(ipv6=ipv6) as session:
-                        async with session.post(self.checkImage, data=check_data, headers=h) as req:
-                            text = await req.text()
-                            data_resp = ujson.loads(text)
-                except BaseException:
-                    continue
-                
-                if not data_resp.get("success", False):
-                    continue
-                
-                sign = data_resp["params"]
-                
-                # 成功！放入预取池
-                captcha_item = (p_uuid, token, sign, base_header)
-                try:
-                    self._captcha_pool.put_nowait(captcha_item)
-                    self._token_captcha_count += 1
-                    pool_size = self._captcha_pool.qsize()
-                    if pool_size % 5 == 0:
-                        logger.info(f"📦 预取池: {pool_size}/{self._captcha_pool_size} 个验证码就绪")
-                except asyncio.QueueFull:
-                    pass
-                
-            except BaseException as e:
-                logger.debug(f"验证码预取异常: {e}")
-                await asyncio.sleep(0.3)
-        
-        logger.info("验证码预取池已停止")
-    
-    def _ensure_filler_running(self):
-        """确保预取后台任务在运行（启动多个并发filler）"""
-        if not self._captcha_filler_running:
-            self._captcha_filler_running = True
-            for i in range(self._captcha_filler_count):
-                task = asyncio.ensure_future(self._captcha_filler())
-                self._captcha_filler_tasks.append(task)
-            logger.info(f"🔧 启动 {self._captcha_filler_count} 个验证码预取worker")
-    
     async def _add_blocked_ip(self, ip, cooldown=90):
         """异步添加 IP 到黑名单缓存（支持冷却秒数，到期自动释放）
         
@@ -770,6 +998,38 @@ class beian:
         except Exception as e:
             logger.debug(f"保存封禁IP缓存失败: {e}")
 
+    def _get_ip_state(self, ipv6: str) -> IPState:
+        """按 IPv6 获取（或惰性创建）独立 IPState。"""
+        if ipv6 is None:
+            return IPState(ipv6="")
+        states = getattr(self, "_ip_states", None)
+        if states is None:
+            states = {}
+            self._ip_states = states
+        state = states.get(ipv6)
+        if state is None:
+            state = IPState(ipv6=ipv6)
+            states[ipv6] = state
+        return state
+
+    def _note_ip_result(self, ipv6: str, status: object) -> IPState:
+        """记录一次 HTTP 查询结果到对应 IPState（纯统计，不改变调度/风控）。"""
+        if not ipv6:
+            return IPState(ipv6="")
+        state = self._get_ip_state(ipv6)
+        state.request_count += 1
+        state.last_request_time = time.time()
+        if status == 200:
+            state.success_count += 1
+            state.last_success = time.time()
+        elif status == 403:
+            state.consecutive_403 += 1
+            state.consecutive_failures += 1
+        elif status == "network" or (isinstance(status, int) and status >= 500):
+            state.network_error_count += 1
+            state.consecutive_failures += 1
+        return state
+
     async def _replace_blocked_ip(self, ip):
         """关闭被封IP的会话/指纹缓存，并从IPv6池中换一个新地址。"""
         if not ip:
@@ -803,8 +1063,9 @@ class beian:
         """上游限流/拦截时：冷却当前IP并轮换粘性IP，避免单IP持续被打"""
         if ipv6:
             await self._add_blocked_ip(ipv6, cooldown=cooldown)
+            # 该 IP 进入冷却，重置其独立计数，避免复用时立刻再次轮换
+            self._get_ip_state(ipv6).request_count = 0
         self._sticky_ipv6 = None
-        self._ip_queries_used = 0
 
     def get_fingerprint(self, ip):
         """获取某IP的稳定浏览器身份档案（首次生成，之后永久复用同一身份）。
@@ -1005,9 +1266,8 @@ class beian:
         """从池中获取或创建 session；整个进程生命周期内按出口复用。"""
         self._init_session_pool()
 
+        # 选 IP 的唯一入口在 get_session()，这里只负责按传入的出口复用 session
         local_ipv6 = ipv6
-        if not local_ipv6 and not proxy and self.local_ipv6_addresses:
-            local_ipv6 = await self._get_next_ipv6()
 
         key = (proxy or "", local_ipv6 or "__default__")
 
@@ -1051,12 +1311,12 @@ class beian:
                 and (ipv6 is None or (isinstance(ipv6, str) and ipv6.startswith("tunnel-")))):
             proxy = self._tunnel_url
             ipv6 = None
+        # 唯一选 IP 的入口：get_session 负责解析出口，_get_session_from_pool 不再自行选择。
+        if not proxy and ipv6 is None and self.local_ipv6_addresses:
+            ipv6 = await self._get_next_ipv6()
         session = await self._get_session_from_pool(proxy, ipv6=ipv6)
-        local_ipv6 = ipv6
-        if not local_ipv6 and not proxy and self.local_ipv6_addresses:
-            local_ipv6 = await self._get_next_ipv6()
-        if local_ipv6:
-            logger.debug(f"使用本地 IPv6 地址：{local_ipv6}")
+        if ipv6:
+            logger.debug(f"使用本地 IPv6 地址：{ipv6}")
         try:
             yield session
         except GeneratorExit:
@@ -1065,14 +1325,14 @@ class beian:
 
     async def get_token(self, proxy="", force_refresh=False, ipv6=None, ctx=None):
         # ctx: QueryContext实例，支持并发隔离。None时使用实例状态（向后兼容）
-        _token = ctx.token if ctx else self.token
-        _token_expire = ctx.token_expire if ctx else self.token_expire
-        _token_ipv6 = ctx.token_ipv6 if ctx else self._token_ipv6
-        _captcha_count = ctx.captcha_count if ctx else self._token_captcha_count
-        _consecutive_fails = ctx.consecutive_fails if ctx else self._token_consecutive_fails
-        _force_refresh = ctx.force_refresh if ctx else self._token_force_refresh
+        _token = ctx.token if ctx else self._credential.token
+        _token_expire = ctx.token_expire if ctx else self._credential.token_expire
+        _token_ipv6 = ctx.token_ipv6 if ctx else self._credential.token_ipv6
+        _captcha_count = ctx.captcha_count if ctx else self._credential.captcha_count
+        _consecutive_fails = ctx.consecutive_fails if ctx else self._credential.consecutive_fails
+        _force_refresh = ctx.force_refresh if ctx else self._credential.force_refresh
         _max_captcha = ctx.max_captcha_per_token if ctx else self._max_captcha_per_token
-        _lock = ctx.token_lock if ctx else self._token_fetch_lock
+        _lock = ctx.token_lock if ctx else self._credential.credential_lock
         
         base_header = ctx._get_base_header() if ctx else _random_browser_headers()
 
@@ -1088,11 +1348,11 @@ class beian:
         async with _lock:
             # 双重检查：可能在等锁期间Token已被其他协程获取
             # 重新读取（ctx可能在等锁期间被更新）
-            _token2 = ctx.token if ctx else self.token
-            _token_expire2 = ctx.token_expire if ctx else self.token_expire
-            _token_ipv6_2 = ctx.token_ipv6 if ctx else self._token_ipv6
-            _captcha_count2 = ctx.captcha_count if ctx else self._token_captcha_count
-            _force_refresh2 = ctx.force_refresh if ctx else self._token_force_refresh
+            _token2 = ctx.token if ctx else self._credential.token
+            _token_expire2 = ctx.token_expire if ctx else self._credential.token_expire
+            _token_ipv6_2 = ctx.token_ipv6 if ctx else self._credential.token_ipv6
+            _captcha_count2 = ctx.captcha_count if ctx else self._credential.captcha_count
+            _force_refresh2 = ctx.force_refresh if ctx else self._credential.force_refresh
             
             if not force_refresh and not _force_refresh2 \
                and _captcha_count2 < _max_captcha \
@@ -1111,12 +1371,12 @@ class beian:
                     ctx.consecutive_fails = 0
                     ctx.force_refresh = False
                 else:
-                    self.token = ""
-                    self.token_expire = 0
-                    self._token_ipv6 = None
-                    self._token_captcha_count = 0
-                    self._token_consecutive_fails = 0
-                    self._token_force_refresh = False
+                    self._credential.token = ""
+                    self._credential.token_expire = 0
+                    self._credential.token_ipv6 = None
+                    self._credential.captcha_count = 0
+                    self._credential.consecutive_fails = 0
+                    self._credential.force_refresh = False
                 logger.info("🔄 Token 强制轮换，获取新 Token...")
             else:
                 logger.debug(f"🆕 无缓存Token或已过期, 获取新Token...")
@@ -1180,12 +1440,12 @@ class beian:
                                 ctx.consecutive_fails = 0
                                 ctx.force_refresh = False
                             else:
-                                self.token = token
-                                self.token_expire = expire
-                                self._token_ipv6 = ipv6
-                                self._token_captcha_count = 0
-                                self._token_consecutive_fails = 0
-                                self._token_force_refresh = False
+                                self._credential.token = token
+                                self._credential.token_expire = expire
+                                self._credential.token_ipv6 = ipv6
+                                self._credential.captcha_count = 0
+                                self._credential.consecutive_fails = 0
+                                self._credential.force_refresh = False
                             logger.info(f"🔑 新 Token 已获取 (IP={ipv6})，过期倒计时: {expire/1000:.0f}s")
                             self._auth_waf_fail_streak = 0
                             return True, token, base_header
@@ -1197,6 +1457,14 @@ class beian:
                         "cannot assign requested address", "cannot bind",
                         "invalid address", "address is not valid")):
                     # 地址在系统里已失效/被删除，直接长冷却并触发替换，避免反复白打码
+                    logger.warning(f"⚠️ IPv6地址失效(非WAF): {ipv6[-12:]}")
+                    _pool = getattr(self, '_ipv6_pool', None)
+                    if _pool is not None:
+                        try:
+                            await _pool._refresh_system_addresses()
+                            await _pool._check_prefix_change()
+                        except Exception:
+                            pass
                     await self._add_blocked_ip(ipv6, cooldown=1800)
                 logger.warning(f"get_token Faile : {msg}")
                 return False, msg, ""
@@ -1332,32 +1600,21 @@ class beian:
                     proxy=proxy, ipv6=ipv6, ctx=ctx, _skip_shared=True,
                 )
         
-        # === 验证码预取池：非阻塞尝试，池空则走正常流程 ===
-        self._ensure_filler_running()
-        try:
-            captcha_item = self._captcha_pool.get_nowait()
-            p_uuid, token, sign, base_header = captcha_item
-            base_header["Content-Type"] = "application/json"
-            logger.debug(f"📦 从预取池取出验证码 (池剩余: {self._captcha_pool.qsize()})")
-            return True, p_uuid, token, sign, base_header
-        except asyncio.QueueEmpty:
-            pass  # 池空，走正常打码流程
-        
         # === Token 轮换：检查是否需要主动刷新 ===
-        _captcha_count = ctx.captcha_count if ctx else self._token_captcha_count
+        _captcha_count = ctx.captcha_count if ctx else self._credential.captcha_count
         _max_captcha = ctx.max_captcha_per_token if ctx else self._max_captcha_per_token
         if _captcha_count >= _max_captcha:
             logger.info(f"🔄 Token 已达 {_max_captcha} 次上限，主动轮换...")
             if ctx:
                 ctx.force_refresh = True
             else:
-                self._token_force_refresh = True
+                self._credential.force_refresh = True
         
         # 复用传入的IPv6（同查询链路优化），没有则获取新的
         if ipv6 is None and not proxy and self.local_ipv6_addresses:
             ipv6 = await self._get_ipv6_sticky()
         
-        _force_refresh = ctx.force_refresh if ctx else self._token_force_refresh
+        _force_refresh = ctx.force_refresh if ctx else self._credential.force_refresh
         success, token, base_header = await self.get_token(proxy, force_refresh=_force_refresh, ipv6=ipv6, ctx=ctx)
         _t_token = time.time()
         if not success:
@@ -1371,8 +1628,6 @@ class beian:
             base_header["Content-Type"] = "application/json"
             
             # 获取验证码图片
-            req_status = None
-            res_text = ""
             try:
                 async with self.get_session(proxy, ipv6=ipv6) as session:
                     async with session.post(self.getCheckImage, data=data, headers=base_header, proxy=proxy if proxy else None) as req:
@@ -1382,16 +1637,10 @@ class beian:
                                 self.merge_cookies_into(base_header, set_cookies)
                         except Exception:
                             pass
-                        req_status = getattr(req, "status", None)
                         res_text = await req.text()
                         res = ujson.loads(res_text)
             except BaseException as e:
-                err_detail = f"{type(e).__name__}: {e}"
-                if req_status is not None:
-                    err_detail += f" | HTTP={req_status}"
-                if res_text:
-                    err_detail += f" | body={res_text[:200]!r}"
-                logger.warning(f"请求验证码时失败：{err_detail}")
+                logger.info(f"请求验证码时失败：{e}")
                 # 403 / 非JSON响应 = Token可能已失效，触发强制轮换
                 if ctx:
                     ctx.consecutive_fails += 1
@@ -1399,11 +1648,11 @@ class beian:
                         logger.warning(f"⛔ 获取验证码连续{ctx.consecutive_fails}次失败，标记Token强制刷新")
                         ctx.force_refresh = True
                 else:
-                    self._token_consecutive_fails += 1
-                    if self._token_consecutive_fails >= 2:
-                        logger.warning(f"⛔ 获取验证码连续{self._token_consecutive_fails}次失败，标记Token强制刷新")
-                        self._token_force_refresh = True
-                return False, f"请求验证码时失败：{err_detail}", '', '', ''
+                    self._credential.consecutive_fails += 1
+                    if self._credential.consecutive_fails >= 2:
+                        logger.warning(f"⛔ 获取验证码连续{self._credential.consecutive_fails}次失败，标记Token强制刷新")
+                        self._credential.force_refresh = True
+                return False, f"请求验证码时失败：{e}", '', '', ''
 
             _t_getimg = time.time()
             logger.info(f"⏱️ auth={(_t_token-_t0)*1000:.0f}ms, getImg={(_t_getimg-_t_token)*1000:.0f}ms")
@@ -1442,10 +1691,10 @@ class beian:
                         logger.warning(f"⛔ 提交验证码连续{ctx.consecutive_fails}次失败，标记Token强制刷新")
                         ctx.force_refresh = True
                 else:
-                    self._token_consecutive_fails += 1
-                    if self._token_consecutive_fails >= 2:
-                        logger.warning(f"⛔ 提交验证码连续{self._token_consecutive_fails}次失败，标记Token强制刷新")
-                        self._token_force_refresh = True
+                    self._credential.consecutive_fails += 1
+                    if self._credential.consecutive_fails >= 2:
+                        logger.warning(f"⛔ 提交验证码连续{self._credential.consecutive_fails}次失败，标记Token强制刷新")
+                        self._credential.force_refresh = True
                 return False, f"提交验证码时失败：{e}", '', '', ''
 
             _t_check = time.time()
@@ -1461,11 +1710,11 @@ class beian:
                         logger.warning(f"⛔ 连续{ctx.consecutive_fails}次打码失败，标记Token强制刷新")
                         ctx.force_refresh = True
                 else:
-                    self._token_consecutive_fails += 1
-                    logger.warning(f"⚠️ 打码失败 (连续{self._token_consecutive_fails}次)")
-                    if self._token_consecutive_fails >= 2:
-                        logger.warning(f"⛔ 连续{self._token_consecutive_fails}次打码失败，标记Token强制刷新")
-                        self._token_force_refresh = True
+                    self._credential.consecutive_fails += 1
+                    logger.warning(f"⚠️ 打码失败 (连续{self._credential.consecutive_fails}次)")
+                    if self._credential.consecutive_fails >= 2:
+                        logger.warning(f"⛔ 连续{self._credential.consecutive_fails}次打码失败，标记Token强制刷新")
+                        self._credential.force_refresh = True
                 
                 captcha_config = getattr(config, 'captcha', object())
                 if getattr(captcha_config, 'save_failed_img', False):
@@ -1488,9 +1737,9 @@ class beian:
                     _cc = ctx.captcha_count
                     _mc = ctx.max_captcha_per_token
                 else:
-                    self._token_captcha_count += 1
-                    self._token_consecutive_fails = 0
-                    _cc = self._token_captcha_count
+                    self._credential.captcha_count += 1
+                    self._credential.consecutive_fails = 0
+                    _cc = self._credential.captcha_count
                     _mc = self._max_captcha_per_token
                 sign = data["params"]
                 
@@ -1502,7 +1751,7 @@ class beian:
                 logger.info(f"⏱️ check_img成功: auth={(_t_token-_t0)*1000:.0f}ms img={(_t_getimg-_t_token)*1000:.0f}ms match={(_t_match-_t_getimg)*1000:.0f}ms submit={(_t_check-_t_match)*1000:.0f}ms total={_t_total:.0f}ms")
                 # 共享token模式：真实取号成功后立即共享给所有worker（含失效后重取）
                 if self._shared_token_mode:
-                    _exp_ms = ctx.token_expire if ctx else self.token_expire
+                    _exp_ms = ctx.token_expire if ctx else self._credential.token_expire
                     self._shared_cred = (p_uuid, token, sign, dict(base_header), _exp_ms)
                     self._shared_active = True
                 return True, p_uuid, token, sign, base_header
@@ -1516,10 +1765,10 @@ class beian:
                     logger.warning(f"⛔ 连续{ctx.consecutive_fails}次check异常，标记Token强制刷新")
                     ctx.force_refresh = True
             else:
-                self._token_consecutive_fails += 1
-                if self._token_consecutive_fails >= 2:
-                    logger.warning(f"⛔ 连续{self._token_consecutive_fails}次check异常，标记Token强制刷新")
-                    self._token_force_refresh = True
+                self._credential.consecutive_fails += 1
+                if self._credential.consecutive_fails >= 2:
+                    logger.warning(f"⛔ 连续{self._credential.consecutive_fails}次check异常，标记Token强制刷新")
+                    self._credential.force_refresh = True
             logger.info(f"⏱️ check_img失败-异常: total={(time.time()-_t0)*1000:.0f}ms")
             return False, str(e), '', '', ''
 
@@ -1567,13 +1816,11 @@ class beian:
             else:
                 # 批量模式：达到每IP配额后强制轮换IP（防单IP被限流/封禁）
                 if (self._batch_mode and self._sticky_ipv6 is not None
-                        and self._ip_queries_used >= self._queries_per_ip):
+                        and self._get_ip_state(self._sticky_ipv6).request_count >= self._queries_per_ip):
                     self._sticky_ipv6 = None
-                    self._token_force_refresh = True
-                    self._ip_queries_used = 0
+                    self._credential.force_refresh = True
                 if self._sticky_ipv6 is None and not proxy and self.local_ipv6_addresses:
                     self._sticky_ipv6 = await self._get_ipv6_sticky()
-                    self._ip_queries_used = 0
                 ipv6 = self._sticky_ipv6
 
             if getattr(getattr(config, 'captcha', object()), 'enable', False):
@@ -1599,7 +1846,7 @@ class beian:
                         ctx.force_refresh = True
                         ctx.ipv6 = await self._get_ipv6_sticky()
                     else:
-                        self._token_force_refresh = True
+                        self._credential.force_refresh = True
                         self._sticky_ipv6 = None
                     continue
 
@@ -1612,7 +1859,7 @@ class beian:
                         headers=base_header,
                         proxy=proxy if proxy else None) as req:
                         res = await req.text()
-                self._ip_queries_used += 1
+                self._get_ip_state(self._sticky_ipv6).request_count += 1
                 break  # 成功，退出重试循环
             else:
                 success, token, base_header = await self.get_token(proxy, ipv6=ipv6, ctx=ctx)
@@ -1641,7 +1888,7 @@ class beian:
                         json=info, headers=base_header,
                         proxy=proxy if proxy else None) as req:
                         res = await req.text()
-                    self._ip_queries_used += 1
+                    self._get_ip_state(self._sticky_ipv6).request_count += 1
 
                     if "当前访问疑似黑客攻击" in res:
                         if current_ip:
@@ -1755,13 +2002,11 @@ class beian:
         for ip_attempt in range(max_ip_retries):
             # 批量模式：达到每IP配额后强制轮换IP（防单IP被限流/封禁）
             if (self._batch_mode and self._sticky_ipv6 is not None
-                    and self._ip_queries_used >= self._queries_per_ip):
+                    and self._get_ip_state(self._sticky_ipv6).request_count >= self._queries_per_ip):
                 self._sticky_ipv6 = None
-                self._token_force_refresh = True
-                self._ip_queries_used = 0
+                self._credential.force_refresh = True
             if self._sticky_ipv6 is None and not proxy and self.local_ipv6_addresses:
                 self._sticky_ipv6 = await self._get_ipv6_sticky()
-                self._ip_queries_used = 0
             ipv6 = self._sticky_ipv6
 
             if getattr(getattr(config, 'captcha', object()), 'enable', False):
@@ -1776,7 +2021,7 @@ class beian:
                         continue
                     # 验证码/Token失败 → 强制刷新Token + 切换IP重试
                     logger.warning(f"🔄 打码失败（{err_msg[:50]}），刷新Token+切换IP重试 ({ip_attempt+1}/{max_ip_retries})")
-                    self._token_force_refresh = True
+                    self._credential.force_refresh = True
                     self._sticky_ipv6 = None
                     continue
 
@@ -1790,7 +2035,7 @@ class beian:
                         data=ujson.dumps(info, ensure_ascii=False),
                         headers=base_header, proxy=proxy if proxy else None) as req:
                         res = await req.text()
-                self._ip_queries_used += 1
+                self._get_ip_state(self._sticky_ipv6).request_count += 1
                 break
             else:
                 success, token, base_header = await self.get_token(proxy, ipv6=ipv6)
@@ -1815,7 +2060,7 @@ class beian:
                     async with session.post((f"{self.blackqueryByCondition}/" if sp == 0 else f"{self.blackappAndMiniByCondition}/"),
                         json=info, headers=base_header, proxy=proxy if proxy else None) as req:
                         res = await req.text()
-                    self._ip_queries_used += 1
+                    self._get_ip_state(self._sticky_ipv6).request_count += 1
 
                     if "当前访问疑似黑客攻击" in res:
                         if current_ip:
@@ -2078,6 +2323,17 @@ class beian:
         total_ips = len(exit_slots)
         if total_ips == 0:
             return [(d, False, "无可用出口") for d in domains]
+
+        # ── 动态候选源：worker 每次需要选 IP 时都应从当前 live 集合重建，而
+        #    不是用任务启动时的静态快照（exit_slots）。池替换/补位进来的新 IP
+        #    会通过 refresh_ipv6_addresses 更新 local_ipv6_addresses，这里实时
+        #    读取它即可让新 IP 被正在运行的任务发现，无需重启任务。
+        #    保持 B1 公平调度算法不变，只替换 candidate source。
+        def _live_ip_members():
+            if tunnel_mode:
+                return ([f"tunnel-{i}" for i in range(self._tunnel_batch_slots)]
+                        + list(self.local_ipv6_addresses))
+            return list(self.local_ipv6_addresses)
         
         # 🔥 回退并发模型 (2026-08-01 v3):
         #   实测: 串行=极慢+创宇盾照样封 → 封IP与并发无关, 是阈值触发
@@ -2129,11 +2385,11 @@ class beian:
                  'http_attempts': 0, 'http_200': 0, 'http_403': 0, 'http_429': 0,
                  'http_5xx': 0, 'latency_ms': 0.0, 'latency_max_ms': 0.0}
         metrics = _QueryMetrics()
+        rm = perf_monitor.RetryMetrics()  # 403→同IP重试 / requeue 域名级生命周期（纯观测）
         stats_lock = asyncio.Lock()
         # 跨worker共享的连续失败计数：避免尾部多worker各自重试、反复空转
         shared_blocked_waits = 0
-        pool_exhausted_since = 0.0  # 池子开始全被封的时刻（用于按时间判断放弃）
-        # IP池全被封后，最多坚持等这么久再放弃（创宇盾最长封1800s，留足余量）
+        pool_exhausted_since = 0.0  # 池子开始全被封/失效的时刻（按时间判断放弃）
         POOL_EXHAUSTED_GIVEUP = max(600.0, float(getattr(
             getattr(config, 'system', object()), 'pool_exhausted_giveup_seconds', 2400) or 2400))
         # 跨worker的IP独占认领：动态补充的新IP不允许被多个worker同时使用，
@@ -2371,7 +2627,9 @@ class beian:
                 empty_rounds = 0
                 candidates = []
                 seen = set()
-                for ip in list(available_ips) + list(exit_slots):
+                # 用实时候选源，让池替换/补位新 IP 也能被预取到 token（否则新 IP
+                # 即使进了候选集也要现场打码，造成 auth 等待）。
+                for ip in _live_ip_members():
                     if ip in seen:
                         continue
                     seen.add(ip)
@@ -2405,8 +2663,34 @@ class beian:
         prefetch_tasks = [asyncio.ensure_future(prefetch_one(ip))
                           for ip in _tunnel_first(available_ips)[:prefetch_count]]
         
+        last_live = [0.0]
+
+        def _live_report():
+            """每60秒输出一次窗口实时指标（纯观测，不改变调度）。"""
+            now = _time.monotonic()
+            if now - last_live[0] < 60:
+                return
+            last_live[0] = now
+            elapsed = _time.time() - t_start
+            completed = stats['ok']
+            attempts = stats['http_attempts']
+            if attempts < 1:
+                return
+            logger.info(perf_monitor.format_live(
+                elapsed, completed,
+                completed / elapsed if elapsed else 0.0,
+                attempts / elapsed if elapsed else 0.0,
+                stats.get('http_403', 0) / attempts,
+                attempts / max(1, completed),
+                stats.get('http_200', 0) / attempts,
+                stats.get('tokens', 0) / max(1, completed) * 1000.0,
+                len(metrics.per_ip) / max(1, completed) * 1000.0,
+                max_workers, len(metrics.per_ip), len(metrics.per_cred),
+            ))
+
         async def safe_update_progress():
-            """安全调用进度回调（含已备案数实时推送）"""
+            """安全调用进度回调（含已备案数实时推送）+ 每60秒输出实时窗口指标。"""
+            _live_report()
             if progress_cb is None:
                 return
             done = stats['ok'] + stats['fail']
@@ -2506,17 +2790,16 @@ class beian:
                         except asyncio.QueueEmpty:
                             break
                     
-                    # ── 检查IP池是否全被封 ──
-                    if not any([not await self._is_ip_blocked(a) for a in exit_slots]):
+                    # ── 检查IP池是否全被封（用实时候选，因为池替换会动态增删成员）──
+                    if not any([not await self._is_ip_blocked(a) for a in _live_ip_members()]):
                         shared_blocked_waits += 1
-                        wait = min(30 * shared_blocked_waits, 120)  # 30s起，上限2分钟
                         if pool_exhausted_since == 0.0:
                             pool_exhausted_since = _time.time()
                         exhausted_for = _time.time() - pool_exhausted_since
+                        wait = min(30 * shared_blocked_waits, 120)  # 30s起，上限2分钟
                         logger.warning(f"⏳ W{worker_id}: 所有IP被封，等待{wait}s"
                                        f"（已持续{exhausted_for:.0f}s/{POOL_EXHAUSTED_GIVEUP}s）")
-                        # 创宇盾封禁是限时的（最长 1800s），必须等到 IP 恢复；
-                        # 之前按“等待60次”提前放弃，导致整个队列被丢弃（实测丢过 9 万条）。
+                        # 封禁/地址失效都是限时的，必须等到恢复；之前按“60次”提前放弃会丢整个队列
                         if exhausted_for >= POOL_EXHAUSTED_GIVEUP:
                             logger.warning(f"⏳ W{worker_id}: IP池持续耗尽{exhausted_for:.0f}s仍未恢复，本批标记失败")
                             await fail_batch("ip_pool_exhausted")
@@ -2527,7 +2810,7 @@ class beian:
                             # 2s细粒度轮询：IP恢复后可立即复工，避免固定10s空等
                             await asyncio.sleep(min(2, deadline - _time.monotonic()))
                             if any([not await self._is_ip_blocked(a)
-                                    for a in exit_slots]):
+                                    for a in _live_ip_members()]):
                                 break
                         # 把已取出但未处理的域名放回队列，等IP恢复后再试
                         for idx, domain in reversed(batch_items):
@@ -2536,14 +2819,16 @@ class beian:
 
                     # ── 每IP独立token + 独占轮转 + 逐条限速 ──
                     shared_blocked_waits = 0
-                    pool_exhausted_since = 0.0  # IP 恢复可用，重置池耗尽计时
+                    pool_exhausted_since = 0.0  # IP 恢复可用，重置计时
 
                     async def ensure_ip_ready():
                         """确保当前IP可用且token有效；否则轮换到下一个未封IP并重新打码。"""
                         nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, token_used, rotation_cap, ip_idx, ip_switch_count, auth_fail_streak
                         if getattr(self, "_auth_global_cooldown_until", 0.0) > _time.monotonic():
                             return False
-                        for _ in range(max(len(ip_slice), len(exit_slots)) * 2):
+                        # 用实时候选规模作为轮换尝试上限，避免静态 exit_slots 低估/高估
+                        _live_size = max(len(_live_ip_members()), len(ip_slice))
+                        for _ in range(max(len(ip_slice), _live_size) * 2):
                             now_ms = int(_time.time() * 1000)
                             if (current_ip is not None and current_ctx is not None
                                     and current_cred is not None
@@ -2572,18 +2857,21 @@ class beian:
                                 current_cred = None
                                 queries_on_ip = 0
                                 token_used = 0
-                            # 轮转找下一个未封IP：先用本worker分片，再补充池中新地址
-                            # （封禁替换会动态新增IP，静态分片看不到新地址会再次卡死）
+                            # 轮转找下一个未封IP：先用本worker分片（保持B1公平起步），
+                            # 再补充当前 live 集合（池替换/补位动态新增的 IP 也能被看到，
+                            # 避免静态 exit_slots 快照导致新 IP 永远进不了候选集）。
                             candidates = list(ip_slice)
                             seen = set(candidates)
-                            for _ip in exit_slots:
+                            for _ip in _live_ip_members():
                                 if _ip not in seen:
                                     candidates.append(_ip)
                                     seen.add(_ip)
 
                             # 🔥 优先复用缓存token的IP：避免每波都重新取号（取号是auth瓶颈）。
-                            # worker在自留IP里反复循环，绝大部分查询走缓存token，零取号等待。
+                            # 公平调度：在“有缓存token且未被封”的可用IP里，选负载最低的，
+                            # 而不是第一个，避免少数热点IP被反复压。仍优先缓存token，不改token生命周期。
                             cached_ip = None
+                            best_cached_load = None
                             for cand in candidates:
                                 if await self._is_ip_blocked(cand):
                                     continue
@@ -2597,9 +2885,13 @@ class beian:
                                 if _c_ctx.token_expire <= int(_time.time() * 1000):
                                     ip_token_cache.pop(cand, None)
                                     continue
-                                if await claim_ip(cand):
+                                _load = self._get_ip_state(cand).request_count
+                                if cached_ip is None or _load < best_cached_load:
                                     cached_ip = cand
-                                    break
+                                    best_cached_load = _load
+                            if cached_ip is not None and not await claim_ip(cached_ip):
+                                # 被其他 worker 抢走：放弃本轮缓存，走下方 fresh 路径
+                                cached_ip = None
                             if cached_ip is not None:
                                 current_ip = cached_ip
                                 _c_ctx, _c_cred, _c_hd, _c_used = ip_token_cache.pop(cached_ip)
@@ -2609,7 +2901,7 @@ class beian:
                                 queries_on_ip = 0
                                 token_used = _c_used
                                 auth_fail_streak = 0
-                                logger.info(f"♻️ W{worker_id} 优先复用缓存Token (IP={current_ip[-12:]}, 已用{_c_used})")
+                                logger.info(f"♻️ W{worker_id} 复用缓存Token (IP={current_ip[-12:]}, 已用{_c_used})")
                                 return True
 
                             # 缓存token用尽后才取预取token（预取=新打码，优先级低于复用）
@@ -2629,15 +2921,31 @@ class beian:
                                     return True
                                 await release_ip(p_ip)
 
+                            # 公平调度：选“当前负载最低且可用（未封/未独占）”的IP；
+                            # 若被其他 worker 抢走则退回旧轮询兜底，避免空转。
                             next_ip = None
-                            for _ in range(len(candidates)):
-                                ip_idx = (ip_idx + 1) % len(candidates)
-                                cand = candidates[ip_idx]
+                            best_load = None
+                            for cand in candidates:
                                 if await self._is_ip_blocked(cand):
                                     continue
-                                if await claim_ip(cand):
+                                if cand in claimed_ips:
+                                    continue
+                                _load = self._get_ip_state(cand).request_count
+                                if next_ip is None or _load < best_load:
                                     next_ip = cand
-                                    break
+                                    best_load = _load
+                            if next_ip is not None and not await claim_ip(next_ip):
+                                # 被其他 worker 抢走：退回旧轮询兜底
+                                next_ip = None
+                            if next_ip is None:
+                                for _ in range(len(candidates)):
+                                    ip_idx = (ip_idx + 1) % len(candidates)
+                                    cand = candidates[ip_idx]
+                                    if await self._is_ip_blocked(cand):
+                                        continue
+                                    if await claim_ip(cand):
+                                        next_ip = cand
+                                        break
                             if next_ip is None:
                                 current_ip = None
                                 current_ctx = None
@@ -2703,6 +3011,16 @@ class beian:
                                     "请求的地址无效", "invalid argument",
                                     "cannot assign requested address", "cannot bind",
                                     "invalid address", "address is not valid")):
+                                # 地址失效(如运营商换前缀)：不是 WAF 封禁。
+                                # 先让池重新发现当前可用前缀，再替换，避免在失效前缀下补新地址。
+                                logger.warning(f"⚠️ W{worker_id} IPv6地址失效(非WAF): {current_ip[-12:]}")
+                                _pool = getattr(self, '_ipv6_pool', None)
+                                if _pool is not None:
+                                    try:
+                                        await _pool._refresh_system_addresses()
+                                        await _pool._check_prefix_change()
+                                    except Exception:
+                                        pass
                                 await self._add_blocked_ip(current_ip, cooldown=1800)
                             else:
                                 # 绝大多数“打码失败/连接抖动/响应非JSON”是瞬时问题，
@@ -2730,6 +3048,11 @@ class beian:
                     async def query_one_with_retry(idx, domain):
                         """单条查询：403/HTML同IP短重试；硬429才拉黑IP并换IP。"""
                         nonlocal current_ip, current_ctx, current_cred, current_headers, queries_on_ip, token_used, rotation_cap, ip_idx, ip_switch_count
+
+                        def _consume_403_retry(success, latency_ms=0.0):
+                            """403→同IP重试的最终结果（按 domain_id 排他，纯计数）。"""
+                            rm.finish_403_retry(idx, success, latency_ms)
+
                         if shared_mode and not await self._shared_try_consume(idx):
                             self._shared_invalidate()
                             return (idx, domain, False, "shared_cap")
@@ -2741,6 +3064,7 @@ class beian:
                         last_reason = "max_retries"
                         for attempt in range(4):
                             if not await ensure_ip_ready():
+                                _consume_403_retry(False, 0.0)
                                 return (idx, domain, False, "ip_pool_exhausted")
                             queries_on_ip += 1
                             token_used += 1
@@ -2762,7 +3086,10 @@ class beian:
                                         current_ctx.queries += 1
                                         current_ctx.last_used = _time.time()
                                         current_ctx.last_status = req.status
-                                        metrics.record(current_ip, req.status, _elapsed_ms, retry=(attempt > 0))
+                                        metrics.record(current_ip, req.status, _elapsed_ms,
+                                                       retry=(attempt > 0),
+                                                       credential_id=_credential_stub(current_cred["token"]))
+                                        self._note_ip_result(current_ip, req.status)
                                         stats['http_attempts'] += 1
                                         stats['latency_ms'] += _elapsed_ms
                                         stats['latency_max_ms'] = max(stats['latency_max_ms'], _elapsed_ms)
@@ -2782,6 +3109,7 @@ class beian:
                                         except Exception:
                                             pass
                                         if req.status == 429:
+                                            _consume_403_retry(False, _elapsed_ms)
                                             drop_token(current_ip)
                                             if rotation_cap > 6:
                                                 rotation_cap = max(6, rotation_cap - 5)
@@ -2795,18 +3123,22 @@ class beian:
                                             # 同IP等0.4秒重试（保留token），4次仍失败才交给延迟重试。
                                             last_reason = "ip_403_streak"
                                             if attempt < 1:
+                                                rm.start_403_retry(idx)
                                                 await asyncio.sleep(0.4)
                                                 continue
+                                            _consume_403_retry(False, _elapsed_ms)
                                             await cache_token(current_ip, current_ctx, current_cred,
                                                                current_headers, token_used)
                                             return (idx, domain, False, "ip_403_streak")
                                         if req.status in (502, 503, 504):
+                                            _consume_403_retry(False, _elapsed_ms)
                                             if attempt < 3:
                                                 stats['retry'] += 1
                                                 await asyncio.sleep(0.5)
                                                 continue
                                             return (idx, domain, False, f"HTTP_{req.status}")
                                         if req.status != 200:
+                                            _consume_403_retry(False, _elapsed_ms)
                                             return (idx, domain, False, f"HTTP_{req.status}")
                                         res_text = await req.text()
                             except asyncio.CancelledError:
@@ -2815,13 +3147,18 @@ class beian:
                                 _t = asyncio.current_task()
                                 if _t is not None and _t.cancelling() > 0:
                                     raise
+                                _consume_403_retry(False, 0.0)
                                 if attempt < 3:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.3)
                                     continue
                                 return (idx, domain, False, "network_error")
                             except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
-                                metrics.record(current_ip, "network", 0.0, retry=(attempt > 0))
+                                metrics.record(current_ip, "network", 0.0,
+                                               retry=(attempt > 0),
+                                               credential_id=_credential_stub(current_cred["token"]))
+                                self._note_ip_result(current_ip, "network")
+                                _consume_403_retry(False, 0.0)
                                 if attempt < 2:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.3 * (attempt + 1))
@@ -2829,6 +3166,7 @@ class beian:
                                 await self._mark_ip_unreachable(current_ip)
                                 return (idx, domain, False, "network_error")
                             except Exception as e:
+                                _consume_403_retry(False, 0.0)
                                 return (idx, domain, False, str(e)[:80])
 
                             try:
@@ -2836,6 +3174,7 @@ class beian:
                             except Exception:
                                 # 非JSON（HTML挑战页）：同上，最多5次机会，再失败换IP
                                 last_reason = "ip_403_streak"
+                                _consume_403_retry(False, _elapsed_ms)
                                 if attempt < 3:
                                     continue
                                 await cache_token(current_ip, current_ctx, current_cred,
@@ -2845,6 +3184,7 @@ class beian:
                             if data.get("code") in (500, 502, 503, 504):
                                 # 上游瞬时错误：短重试，仍失败则延迟重查
                                 last_reason = f"HTTP_{data.get('code')}"
+                                _consume_403_retry(False, _elapsed_ms)
                                 if attempt < 3:
                                     stats['retry'] += 1
                                     await asyncio.sleep(0.5)
@@ -2852,6 +3192,7 @@ class beian:
                                 return (idx, domain, False, last_reason)
                             if data.get("code") == 429:
                                 # 应用层限流：该IP拉黑1800s，换IP重查
+                                _consume_403_retry(False, _elapsed_ms)
                                 drop_token(current_ip)
                                 if rotation_cap > 6:
                                     rotation_cap = max(6, rotation_cap - 5)
@@ -2864,6 +3205,7 @@ class beian:
                                     k in str(data.get("msg") or data.get("message") or "")
                                     for k in ("token", "uuid", "非法", "失效")):
                                 # token失效：刷新当前IP的token后重试
+                                _consume_403_retry(False, _elapsed_ms)
                                 if shared_mode:
                                     self._shared_invalidate()
                                 drop_token(current_ip)
@@ -2875,8 +3217,11 @@ class beian:
                                     continue
                                 return (idx, domain, False, "token_invalid")
                             if data.get('success', False) or data.get('code') == 200:
+                                _consume_403_retry(True, _elapsed_ms)
                                 return (idx, domain, True, data)
+                            _consume_403_retry(False, _elapsed_ms)
                             return (idx, domain, False, data)
+                        _consume_403_retry(False, 0.0)
                         return (idx, domain, False, last_reason)
 
                     async def query_one_parallel(idx, domain):
@@ -2915,7 +3260,10 @@ class beian:
                                         timeout=aiohttp.ClientTimeout(total=5)
                                     ) as req:
                                         _elapsed_ms = (_time.perf_counter() - _req_t0) * 1000.0
-                                        metrics.record(p_ip, req.status, _elapsed_ms, retry=(attempt > 0))
+                                        metrics.record(p_ip, req.status, _elapsed_ms,
+                                                       retry=(attempt > 0),
+                                                       credential_id=_credential_stub(p_cred["token"]))
+                                        self._note_ip_result(p_ip, req.status)
                                         stats['http_attempts'] += 1
                                         stats['latency_ms'] += _elapsed_ms
                                         stats['latency_max_ms'] = max(stats['latency_max_ms'], _elapsed_ms)
@@ -3126,6 +3474,7 @@ class beian:
                             rc = requeue_tracker.get(idx, 0)
                             if rc < MAX_REQUEUE_ATTEMPTS:
                                 requeue_tracker[idx] = rc + 1
+                                rm.on_requeue(idx)
                                 requeue_count += 1
                                 kind = "429" if result == "ip_429" else (
                                     "403" if result in ("ip_403_streak", "shared_cap") else "net")
@@ -3140,6 +3489,7 @@ class beian:
                                     results[idx] = (domain, False, "requeue_exhausted")
                                 except Exception:
                                     pass
+                                rm.on_final(idx, False)
                                 async with stats_lock:
                                     stats['fail'] += 1
                                     stats['net_err'] += 1
@@ -3156,6 +3506,8 @@ class beian:
                             results[idx] = (domain, success, result)
                         except Exception:
                             results[idx] = (domain, False, f"result_err:{str(result)[:40]}")
+                            success = False
+                        rm.on_final(idx, bool(success))
                         
                         # 更新统计
                         async with stats_lock:
@@ -3276,6 +3628,7 @@ class beian:
                     _, _, idx, domain = retry_heap.get_nowait()
                     if results[idx] is None:
                         results[idx] = (domain, False, "requeue_exhausted")
+                        rm.on_final(idx, False)
                         stats['fail'] += 1
                         retry_left += 1
                         if on_result_cb is not None:
@@ -3303,6 +3656,35 @@ class beian:
                 f"打码{stats['tokens']}次, 耗时{elapsed:.1f}s, 业务速度{qps:.1f}q/s ≈ {qph:.0f}QPH, "
                 f"session_hit={getattr(self, '_session_pool_hits', 0)} session_miss={getattr(self, '_session_pool_misses', 0)}"
             )
+            # 统一性能基线（纯观测，不改变调度/请求）
+            try:
+                _base_line = metrics.baseline(
+                    elapsed, total,
+                    domain_ok=stats['ok'], domain_fail=total - stats['ok'],
+                    retry=stats['retry'],
+                    auth=stats.get('auth', 0), captcha=stats.get('tokens', 0),
+                    workers=max_workers,
+                )
+                logger.info(_base_line)
+                # 生产化：自动基线比较 + 三级告警（纯观测，不改行为）
+                try:
+                    _perf_on = bool(getattr(
+                        getattr(config, 'system', object()), 'enable_perf_compare', True))
+                    if _perf_on and not bool(getattr(
+                            getattr(config, 'system', object()), 'no_perf_baseline', False)):
+                        _summary = metrics.summary_dict(
+                            elapsed, total, stats['ok'], total - stats['ok'],
+                            stats['retry'], stats.get('auth', 0),
+                            stats.get('tokens', 0), max_workers)
+                        _base = perf_monitor.load_baseline()
+                        if _base:
+                            _plevel, _ptext, _palerts = perf_monitor.evaluate(_summary, _base)
+                            logger.info(_ptext)
+                    logger.info(rm.format())
+                except Exception as _e:
+                    logger.debug(f"perf compare 输出异常: {_e}")
+            except Exception as _e:
+                logger.debug(f"base line 输出异常: {_e}")
         except Exception as e:
             logger.error(f"💥 stream_query异常: {e}\n{traceback.format_exc()}")
         
@@ -3336,12 +3718,6 @@ class beian:
 
     async def cleanup(self):
         """清理资源"""
-        # 停止验证码预取后台任务
-        self._captcha_filler_running = False
-        for task in self._captcha_filler_tasks:
-            if not task.done():
-                task.cancel()
-        self._captcha_filler_tasks.clear()
         # 关闭 session 池中的所有连接
         if hasattr(self, '_session_close_tasks'):
             for task in list(self._session_close_tasks):
