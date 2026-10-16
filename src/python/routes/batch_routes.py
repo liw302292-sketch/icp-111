@@ -328,13 +328,65 @@ async def create_task(taskname, data, request, searnum, apptype="web", token_poo
             task.query_keywords.append(domain)
             # 用_batch_row生成带真实状态的行，避免失败被误计为“查无备案”
             task.domains.append(_batch_row(domain, success, result))
+            _maybe_checkpoint()
+
+        # 定期检查点：进程被杀/断电/重启时，已查出的结果不会丢。
+        _ckpt = {"last": 0.0, "writing": False}
+
+        def _write_checkpoint(rows, keywords, completed):
+            try:
+                results_dir = "batch_results"
+                os.makedirs(results_dir, exist_ok=True)
+                path = os.path.join(results_dir, f"{taskname}_partial.json")
+                tmp = path + ".tmp"
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    json.dump({
+                        'task_name': taskname,
+                        'task_type': apptype,
+                        'total_count': len(data),
+                        'completed_count': completed,
+                        'query_keywords': keywords,
+                        'summary': _summarize_rows(rows),
+                        'partial': True,
+                        'result': rows,
+                    }, f, ensure_ascii=False)
+                os.replace(tmp, path)
+            except Exception as e:
+                logger.warning(f"检查点保存失败: {e}")
+
+        def _maybe_checkpoint(force=False):
+            now = datetime.now().timestamp()
+            if not force and now - _ckpt["last"] < 60:
+                return
+            if _ckpt["writing"]:
+                return
+            _ckpt["last"] = now
+            _ckpt["writing"] = True
+            rows = list(task.domains)
+            keywords = list(task.query_keywords)
+            completed = len(rows)
+
+            async def _run():
+                try:
+                    await asyncio.to_thread(_write_checkpoint, rows, keywords, completed)
+                finally:
+                    _ckpt["writing"] = False
+
+            try:
+                asyncio.get_running_loop().create_task(_run())
+            except RuntimeError:
+                _ckpt["writing"] = False
+
+        # 供停止/删除任务时立刻落盘一次，避免“暂停后已查结果全丢”
+        task._checkpoint_now = _maybe_checkpoint
         
         # 🌊 一次调用stream_query处理全部域名（内部IP独立流水线+即时重试）
         all_results = await myicp.stream_query(data, sp=0, pageSize=26, 
                                                 queries_per_ip=QUERIES_PER_IP,
                                                 max_workers=auto_workers,
                                                 progress_cb=on_progress,
-                                                on_result_cb=on_result)
+                                                on_result_cb=on_result,
+                                                cancel_check=lambda: bool(getattr(task, 'cancelled', False)))
         
         myicp._batch_mode = False
         
@@ -456,6 +508,13 @@ async def create_task(taskname, data, request, searnum, apptype="web", token_poo
                     finish_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 )
                 logger.info(f"批量任务 {taskname} 已完成，结果已保存到 {result_file}")
+            # 正式结果已落盘，删除过程性检查点，避免目录里留下两份
+            try:
+                _partial = os.path.join(results_dir, f"{taskname}_partial.json")
+                if os.path.exists(_partial):
+                    os.remove(_partial)
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"保存任务结果失败: {e}")
 
@@ -615,6 +674,31 @@ async def del_task(request):
             # 标记任务为取消状态
             task = request.app["tasks"][taskname]
             task.cancelled = True
+
+            # 🔥 停止/删除前先把已查出的结果落盘。
+            # 之前删除任务会直接丢内存态结果（曾因此丢掉 1 万多条已查数据）。
+            try:
+                _ck = getattr(task, "_checkpoint_now", None)
+                if callable(_ck) and len(getattr(task, "domains", []) or []) > 0:
+                    # 直接同步落盘一次，避免删掉 task 后异步任务拿不到数据
+                    rows = list(task.domains)
+                    keywords = list(getattr(task, "query_keywords", []) or [])
+                    results_dir = "batch_results"
+                    os.makedirs(results_dir, exist_ok=True)
+                    path = os.path.join(results_dir, f"{taskname}_stopped.json")
+                    with open(path, 'w', encoding='utf-8') as f:
+                        json.dump({
+                            'task_name': taskname,
+                            'total_count': getattr(task, 'numpro', len(rows)),
+                            'completed_count': len(rows),
+                            'query_keywords': keywords,
+                            'summary': _summarize_rows(rows),
+                            'stopped': True,
+                            'result': rows,
+                        }, f, ensure_ascii=False)
+                    logger.warning(f"⏸️ 任务 {taskname} 已停止，已查 {len(rows)} 条结果已保存到 {path}")
+            except Exception as e:
+                logger.error(f"停止任务时保存结果失败: {e}")
             
             # 从任务管理器中移除
             task_manager = request.app.get('task_manager')

@@ -2289,7 +2289,8 @@ class beian:
     # IP之间不互相等待，查询失败立即重试，无批次边界
     # ═══════════════════════════════════════════════════════════
     async def stream_query(self, domains, sp=0, pageSize=26, queries_per_ip=20, 
-                           max_workers=0, progress_cb=None, on_result_cb=None):
+                           max_workers=0, progress_cb=None, on_result_cb=None,
+                           cancel_check=None):
         """流式流水线批量查询——无批次，每IP独立工作
         
         Args:
@@ -2300,6 +2301,8 @@ class beian:
             max_workers: 最大并发IP数（0=自动计算）
             progress_cb: 进度回调 async def(completed, total, reg_count)
             on_result_cb: 结果回调 async def(domain, success, result) — 每条查询完成时立即推送
+            cancel_check: 可选同步回调 def() -> bool。返回 True 时所有 worker 立即退出。
+                用于 UI 停止/删除任务后真正停下查询，避免 worker 在后台空转刷日志。
         """
         import random, time as _time, traceback
         
@@ -2707,6 +2710,16 @@ class beian:
             硬429（访问频次过高）才拉黑IP（1800s），403挑战页不拉黑。"""
             nonlocal shared_blocked_waits, pace_ok, pace_attempts, slow_mode, pool_exhausted_since
             try:
+
+                def _cancelled():
+                    """UI 停止/删除任务后，worker 必须尽快退出，不能继续空转刷日志。"""
+                    if cancel_check is None:
+                        return False
+                    try:
+                        return bool(cancel_check())
+                    except Exception:
+                        return False
+
                 if shared_mode:
                     # 共享模式取号是瞬时的（无真实auth错峰），worker同时开火会撞429；
                     # 按worker_id错峰0.15s，平滑首波查询
@@ -2738,6 +2751,10 @@ class beian:
                     await safe_update_progress()
                 
                 while True:
+                    if _cancelled():
+                        logger.warning(f"🛑 W{worker_id} 收到停止指令，退出查询")
+                        return
+
                     # 全局 auth 风控熔断：auth 已被创宇盾连续拦截时，
                     # 不再继续批量取域名制造 retry storm。
                     _global_auth_wait = getattr(self, "_auth_global_cooldown_until", 0.0) - _time.monotonic()
@@ -2809,6 +2826,8 @@ class beian:
                         while _time.monotonic() < deadline:
                             # 2s细粒度轮询：IP恢复后可立即复工，避免固定10s空等
                             await asyncio.sleep(min(2, deadline - _time.monotonic()))
+                            if _cancelled():
+                                return
                             if any([not await self._is_ip_blocked(a)
                                     for a in _live_ip_members()]):
                                 break
@@ -2829,6 +2848,8 @@ class beian:
                         # 用实时候选规模作为轮换尝试上限，避免静态 exit_slots 低估/高估
                         _live_size = max(len(_live_ip_members()), len(ip_slice))
                         for _ in range(max(len(ip_slice), _live_size) * 2):
+                            if _cancelled():
+                                return False
                             now_ms = int(_time.time() * 1000)
                             if (current_ip is not None and current_ctx is not None
                                     and current_cred is not None
