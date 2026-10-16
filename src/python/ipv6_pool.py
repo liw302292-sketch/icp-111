@@ -529,6 +529,28 @@ class IPv6AddressPool:
             # 2. 检查前缀是否变化
             prefix_changed = await self._check_prefix_change()
 
+            # 2.2 定期验证当前前缀是否仍可达。
+            # 运营商换前缀后，旧前缀地址仍绑在网卡上(不报“地址无效”)，但已不通；
+            # _check_prefix_change 只会“检测到新增前缀”，不会切换，于是任务卡在死前缀上。
+            now_v = time.time()
+            if now_v - getattr(self, '_last_prefix_verify', 0.0) >= 30:
+                self._last_prefix_verify = now_v
+                _cur = [a for a in list(self.active_addresses)
+                        if a.startswith((self._last_prefix or '') + ':')]
+                if _cur:
+                    _sample = random.choice(_cur)
+                    if not await self._verify_ipv6_address(_sample):
+                        logger.warning(f"⚠️ 当前前缀 {self._last_prefix}::/64 已不可达，重新发现可用前缀...")
+                        await self._refresh_system_addresses()
+                        _chosen = await self._discover_working_prefixes()
+                        if _chosen:
+                            self._last_prefix = _chosen[0]
+                            self._last_prefixes = set(_chosen)
+                            logger.warning(f"✅ 已切换到可用前缀: {self._last_prefix}::/64")
+                        else:
+                            logger.error("❌ 未发现任何可达前缀")
+                        prefix_changed = True
+
             # 2.5 仅当 active 池真的超过上限时才裁剪，避免每秒反复洗牌。
             self._cap_pool()
 
